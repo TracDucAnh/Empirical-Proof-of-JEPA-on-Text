@@ -1,9 +1,12 @@
-"""Text JEPA pretraining.
+"""Text JEPA pretraining — architecture faithful to I-JEPA (arXiv 2301.08243).
 
-This script keeps JEPA separate from other anti-collapse methods.  A context
-encoder sees a span-masked sentence, a momentum target encoder sees the clean
-sentence, and a predictor maps context latents to target latents.  The target
-encoder is updated by EMA and receives no gradients.
+Key design decisions mirroring I-JEPA:
+  - Predictor: narrow BERT with input_proj (D→d) and output_proj (d→D).
+    Input and output are both in encoder space D; d=384 is an internal bottleneck.
+  - Target: raw target-encoder output [B, L, D], NO projection.
+  - Loss: token-level L2 over span positions, averaged over spans (not mean-pooled first).
+    Formula matches paper: (1/M) * sum_i sum_{j in B_i} ||pred_j - target_j||^2
+  - Target encoder updated by EMA only, no gradients.
 """
 
 from __future__ import annotations
@@ -47,8 +50,8 @@ class JEPAPretrainConfig:
     loss_plot_name: str = "text_jepa_loss.png"
     plot_every: int = 10
     resume_from_latest: bool = True
-    hidden_dim: int = 768
-    predictor_dim: int = 384
+    hidden_dim: int = 768        # D: encoder hidden size
+    predictor_dim: int = 384     # d: predictor internal bottleneck
     predictor_layers: int = 4
     predictor_heads: int = 6
     predictor_ffn_dim: int = 1536
@@ -56,18 +59,30 @@ class JEPAPretrainConfig:
     max_num_spans: int = 5
     min_num_spans: int = 5
     mask_seed: Optional[int] = None
-    lambda_span: float = 1.0
     ema_decay: float = 0.996
     device: str = "auto"
 
 
 class SmallBertPredictor(nn.Module):
-    """Smaller BERT-style predictor over token latents."""
+    """Narrow BERT predictor that mirrors the I-JEPA predictor design.
+
+    Data flow:
+        [B, L, D]
+          → input_proj  Linear(D → d)
+          → BERT layers (hidden dim = d)
+          → output_proj Linear(d → D)
+        [B, L, D]
+
+    The bottleneck at d forces the predictor to compress context information,
+    preventing it from trivially copying the encoder output.
+    Input and output both live in encoder space D, so the loss is computed
+    directly against the (unprojected) target encoder output.
+    """
 
     def __init__(
         self,
-        input_dim: int,
-        predictor_dim: int,
+        input_dim: int,       # D
+        predictor_dim: int,   # d
         num_heads: int,
         num_layers: int,
         ffn_dim: int,
@@ -79,6 +94,8 @@ class SmallBertPredictor(nn.Module):
             raise ValueError("predictor_dim must be divisible by predictor_heads.")
 
         self.input_proj = nn.Linear(input_dim, predictor_dim)
+        self.output_proj = nn.Linear(predictor_dim, input_dim)  # d → D
+
         predictor_config = BertConfig(
             vocab_size=1,
             hidden_size=predictor_dim,
@@ -97,22 +114,20 @@ class SmallBertPredictor(nn.Module):
         )
         self.bert = BertModel(predictor_config, add_pooling_layer=False)
 
-    def project(self, hidden: torch.Tensor) -> torch.Tensor:
-        return self.input_proj(hidden)
-
     def forward(
         self,
-        hidden: torch.Tensor,
+        hidden: torch.Tensor,          # [B, L, D]
         attention_mask: torch.Tensor,
         token_type_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        output = self.bert(
-            inputs_embeds=self.project(hidden),
+    ) -> torch.Tensor:                 # [B, L, D]
+        x = self.input_proj(hidden)    # [B, L, d]
+        x = self.bert(
+            inputs_embeds=x,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             return_dict=True,
-        )
-        return output.last_hidden_state
+        ).last_hidden_state            # [B, L, d]
+        return self.output_proj(x)     # [B, L, D]
 
 
 class TextJEPA(nn.Module):
@@ -144,9 +159,28 @@ class TextJEPA(nn.Module):
             parameter.requires_grad = False
 
     @staticmethod
-    def span_mean_pool(hidden: torch.Tensor, span_mask: torch.Tensor) -> torch.Tensor:
-        mask = span_mask.unsqueeze(-1).float()
-        return (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+    def span_jepa_loss(
+        pred: torch.Tensor,       # [B, L, D]
+        target: torch.Tensor,     # [B, L, D]
+        span_mask: torch.Tensor,  # [B, L]  binary, 1 at span token positions
+    ) -> torch.Tensor:
+        """Token-level L2 loss over span positions, averaged over spans.
+
+        Mirrors I-JEPA paper eq: (1/M) * sum_i sum_{j in B_i} ||pred_j - target_j||^2_2
+
+        Here M*|B_i| is approximated by the total number of span tokens (sum of span_mask),
+        so we compute mean L2 per span token — equivalent to the paper when spans are
+        equal size, and a sensible normalisation otherwise.
+
+        We do NOT pool tokens before computing loss (that would destroy per-token signal).
+        """
+        # squared L2 per token per dim: [B, L, D] -> [B, L]
+        l2_per_token = ((pred - target) ** 2).sum(dim=-1)
+        # zero out non-span positions
+        masked = l2_per_token * span_mask.float()
+        # mean over span tokens (total span tokens across batch)
+        n_span_tokens = span_mask.float().sum().clamp(min=1.0)
+        return masked.sum() / n_span_tokens
 
     def encode(
         self,
@@ -161,7 +195,7 @@ class TextJEPA(nn.Module):
             token_type_ids=token_type_ids,
             return_dict=True,
         )
-        return output.last_hidden_state
+        return output.last_hidden_state  # [B, L, D]
 
     @torch.no_grad()
     def update_target_encoder(self, decay: float) -> None:
@@ -169,34 +203,40 @@ class TextJEPA(nn.Module):
             target.data.mul_(decay).add_(context.data, alpha=1.0 - decay)
 
     def forward(self, batch: dict) -> dict:
+        # Context encoder sees the span-masked sentence
         masked_hidden = self.encode(
             self.context_encoder,
             batch["masked_input_ids"],
             batch["masked_attention_mask"],
             batch["masked_token_type_ids"],
-        )
+        )  # [B, L, D]
+
+        # Target encoder sees the clean sentence — no gradients, no projection
         with torch.no_grad():
             clean_hidden = self.encode(
                 self.target_encoder,
                 batch["clean_input_ids"],
                 batch["clean_attention_mask"],
                 batch["clean_token_type_ids"],
-            )
+            )  # [B, L, D]
 
+        # Predictor: D → d (internal) → D
         predicted_hidden = self.predictor(
             masked_hidden,
             batch["masked_attention_mask"],
             batch["masked_token_type_ids"],
+        )  # [B, L, D]
+
+        # Loss: token-level L2 on span positions, target is raw encoder output (D)
+        span_loss = self.span_jepa_loss(
+            predicted_hidden,
+            clean_hidden.detach(),
+            batch["span_mask"],
         )
-        with torch.no_grad():
-            target_hidden = self.predictor.project(clean_hidden)
-        target_span = self.span_mean_pool(target_hidden, batch["span_mask"]).detach()
-        pred_span = self.span_mean_pool(predicted_hidden, batch["span_mask"])
-        span_loss = F.mse_loss(pred_span, target_span)
 
         return {
-            "target_span": target_span,
-            "pred_span": pred_span,
+            "predicted_hidden": predicted_hidden,
+            "target_hidden": clean_hidden,
             "span_loss": span_loss,
         }
 
@@ -239,7 +279,7 @@ class JEPAPretrainer:
             self.load_latest_if_available()
 
     def objective(self, output: dict) -> tuple[torch.Tensor, dict]:
-        loss = self.cfg.lambda_span * output["span_loss"]
+        loss = output["span_loss"]
         stats = {
             "loss": float(loss.detach()),
             "span": float(output["span_loss"].detach()),
