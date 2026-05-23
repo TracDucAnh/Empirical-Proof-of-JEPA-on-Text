@@ -15,10 +15,11 @@ Collators build the method-specific views:
 
 from __future__ import annotations
 
+import argparse
 import os
 import random
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -86,6 +87,10 @@ def _document_cache_path(cfg: TextDataConfig) -> str:
         f"tr{cfg.train_samples}_va{cfg.validation_samples}_seed{cfg.seed}.pt"
     )
     return os.path.join(cfg.cache_dir, name)
+
+
+def load_cache(path: str) -> dict:
+    return torch.load(path, map_location="cpu", weights_only=False)
 
 
 def _iter_dataset_rows(cfg: TextDataConfig, split: str) -> Iterable[dict]:
@@ -180,7 +185,7 @@ def build_or_load_tokenized(cfg: TextDataConfig) -> Tuple[List[List[int]], List[
     os.makedirs(cfg.cache_dir, exist_ok=True)
     path = _cache_path(cfg)
     if os.path.exists(path):
-        payload = torch.load(path, map_location="cpu")
+        payload = load_cache(path)
         return payload["train_ids"], payload["validation_ids"]
 
     tokenizer = load_tokenizer(cfg.tokenizer_name)
@@ -195,7 +200,7 @@ def build_or_load_tokenized(cfg: TextDataConfig) -> Tuple[List[List[int]], List[
     validation_ids = tokenize_texts(tokenizer, validation_texts)
     torch.save(
         {
-            "config": cfg,
+            "config": asdict(cfg),
             "train_ids": train_ids,
             "validation_ids": validation_ids,
         },
@@ -210,7 +215,7 @@ def build_or_load_tokenized_documents(
     os.makedirs(cfg.cache_dir, exist_ok=True)
     path = _document_cache_path(cfg)
     if os.path.exists(path):
-        payload = torch.load(path, map_location="cpu")
+        payload = load_cache(path)
         return payload["train_documents"], payload["validation_documents"]
 
     tokenizer = load_tokenizer(cfg.tokenizer_name)
@@ -230,7 +235,7 @@ def build_or_load_tokenized_documents(
     validation_ids = tokenize_documents(tokenizer, validation_documents)
     torch.save(
         {
-            "config": cfg,
+            "config": asdict(cfg),
             "train_documents": train_ids,
             "validation_documents": validation_ids,
         },
@@ -607,3 +612,60 @@ def build_bert_pretraining_dataloaders(
         collate_fn=collate_fn,
     )
     return train_loader, validation_loader
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Download and tokenize C4 pretraining data.")
+    parser.add_argument(
+        "--mode",
+        choices=("bert", "sentences", "all"),
+        default="all",
+        help="bert builds document pairs for MLM+NSP; sentences builds single-sentence chunks.",
+    )
+    parser.add_argument("--train-samples", type=int, default=1_000_000)
+    parser.add_argument("--validation-samples", type=int, default=10_000)
+    parser.add_argument("--max-length", type=int, default=128)
+    parser.add_argument("--min-words", type=int, default=8)
+    parser.add_argument("--cache-dir", type=str, default=os.path.join(PROJECT_ROOT, "pretrained_text_cache"))
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--no-streaming", action="store_true")
+    return parser.parse_args()
+
+
+def config_from_args(args: argparse.Namespace) -> TextDataConfig:
+    return TextDataConfig(
+        train_samples=args.train_samples,
+        validation_samples=args.validation_samples,
+        max_length=args.max_length,
+        min_words=args.min_words,
+        cache_dir=args.cache_dir,
+        seed=args.seed,
+        streaming=not args.no_streaming,
+    )
+
+
+def main() -> None:
+    args = parse_args()
+    cfg = config_from_args(args)
+    if cfg.train_samples < 1 or cfg.validation_samples < 1:
+        raise ValueError("train-samples and validation-samples must be positive.")
+
+    if args.mode in {"bert", "all"}:
+        train_documents, validation_documents = build_or_load_tokenized_documents(cfg)
+        print(
+            "bert_cache_ready "
+            f"train_documents={len(train_documents)} "
+            f"validation_documents={len(validation_documents)}"
+        )
+
+    if args.mode in {"sentences", "all"}:
+        train_ids, validation_ids = build_or_load_tokenized(cfg)
+        print(
+            "sentence_cache_ready "
+            f"train_sentences={len(train_ids)} "
+            f"validation_sentences={len(validation_ids)}"
+        )
+
+
+if __name__ == "__main__":
+    main()

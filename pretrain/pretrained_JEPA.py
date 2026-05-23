@@ -25,6 +25,7 @@ if PROJECT_ROOT not in sys.path:
 
 from pretrained_data_sampler import JEPASpanMaskCollator, TextDataConfig, build_pretrain_dataloaders, set_seed
 from pretrain.common import (
+    LossPlotter,
     OptimConfig,
     build_bert_base_config,
     device_from_config,
@@ -40,7 +41,11 @@ class JEPAPretrainConfig:
     data: TextDataConfig = field(default_factory=TextDataConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
     output_dir: str = os.path.join(PROJECT_ROOT, "outputs", "text_jepa")
-    checkpoint_name: str = "text_jepa_latest.pt"
+    checkpoint_name: str = "text_jepa_best.pt"
+    latest_checkpoint_name: str = "text_jepa_latest.pt"
+    loss_plot_name: str = "text_jepa_loss.png"
+    plot_every: int = 10
+    resume_from_latest: bool = True
     hidden_dim: int = 768
     predictor_dim: int = 384
     predictor_layers: int = 4
@@ -196,6 +201,12 @@ class JEPAPretrainer:
         if cfg.optim.max_steps > 0:
             total_steps = min(total_steps, cfg.optim.max_steps)
         self.scheduler = make_scheduler(self.optimizer, cfg.optim, total_steps)
+        self.best_validation_loss = float("inf")
+        self.start_epoch = 0
+        self.global_step = 0
+        self.plotter = LossPlotter(self.loss_plot_path(), "JEPA Pretraining Loss")
+        if cfg.resume_from_latest:
+            self.load_latest_if_available()
 
     def objective(self, output: dict) -> tuple[torch.Tensor, dict]:
         loss = self.cfg.lambda_sent * output["sent_loss"]
@@ -237,33 +248,102 @@ class JEPAPretrainer:
     def checkpoint_path(self) -> str:
         return os.path.join(self.cfg.output_dir, self.cfg.checkpoint_name)
 
+    def latest_checkpoint_path(self) -> str:
+        return os.path.join(self.cfg.output_dir, self.cfg.latest_checkpoint_name)
+
+    def loss_plot_path(self) -> str:
+        return os.path.join(self.cfg.output_dir, self.cfg.loss_plot_name)
+
+    def load_latest_if_available(self) -> None:
+        path = self.latest_checkpoint_path()
+        if not os.path.exists(path):
+            return
+
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        self.model.load_state_dict(checkpoint["model"])
+        self.optimizer.load_state_dict(checkpoint["optimizer"])
+        self.scheduler.load_state_dict(checkpoint["scheduler"])
+        self.best_validation_loss = float(checkpoint.get("best_validation_loss", float("inf")))
+        self.global_step = int(checkpoint.get("step", 0))
+        self.start_epoch = int(checkpoint.get("epoch", -1)) + 1
+        if "plotter_state" in checkpoint:
+            self.plotter.load_state_dict(checkpoint["plotter_state"])
+        print(
+            f"resumed_from={path} start_epoch={self.start_epoch + 1} "
+            f"global_step={self.global_step} best_validation_loss={self.best_validation_loss:.4f}"
+        )
+
     def train(self) -> None:
         os.makedirs(self.cfg.output_dir, exist_ok=True)
-        step = 0
+        step = self.global_step
+        if self.cfg.optim.max_steps > 0 and step >= self.cfg.optim.max_steps:
+            print(f"checkpoint already reached max_steps={self.cfg.optim.max_steps}")
+            return
+
         self.model.train()
-        for epoch in range(self.cfg.optim.epochs):
+        for epoch in range(self.start_epoch, self.cfg.optim.epochs):
             pbar = tqdm(self.train_loader, desc=f"JEPA epoch {epoch + 1}", ncols=120)
             for batch in pbar:
                 stats = self.train_step(batch)
                 step += 1
+                self.plotter.add_train(step, stats["loss"])
+                if step % self.cfg.plot_every == 0:
+                    self.plotter.save()
                 pbar.set_postfix({key: f"{value:.4f}" for key, value in stats.items()})
                 if self.cfg.optim.max_steps > 0 and step >= self.cfg.optim.max_steps:
-                    self.save(epoch, step)
+                    val = self.evaluate()
+                    self.plotter.add_validation(step, val["loss"])
+                    self.plotter.save()
+                    saved = self.save_if_best(epoch, step, val["loss"])
+                    self.save_latest(epoch, step, val["loss"])
+                    print(
+                        f"step={step} validation={val} "
+                        f"best_validation_loss={self.best_validation_loss:.4f} saved_best={saved}"
+                    )
                     return
 
             val = self.evaluate()
-            print(f"epoch={epoch + 1} validation={val}")
-            self.save(epoch, step)
+            self.plotter.add_validation(step, val["loss"])
+            self.plotter.save()
+            saved = self.save_if_best(epoch, step, val["loss"])
+            self.save_latest(epoch, step, val["loss"])
+            print(
+                f"epoch={epoch + 1} validation={val} "
+                f"best_validation_loss={self.best_validation_loss:.4f} saved_best={saved}"
+            )
 
-    def save(self, epoch: int, step: int) -> None:
+    def save_if_best(self, epoch: int, step: int, validation_loss: float) -> bool:
+        if validation_loss >= self.best_validation_loss:
+            return False
+        self.best_validation_loss = validation_loss
+        self.save(self.checkpoint_path(), epoch, step, validation_loss, checkpoint_type="best")
+        return True
+
+    def save_latest(self, epoch: int, step: int, validation_loss: float) -> None:
+        self.save(self.latest_checkpoint_path(), epoch, step, validation_loss, checkpoint_type="latest")
+
+    def save(
+        self,
+        path: str,
+        epoch: int,
+        step: int,
+        validation_loss: float,
+        checkpoint_type: str,
+    ) -> None:
         save_checkpoint(
-            self.checkpoint_path(),
+            path,
             self.model,
             self.optimizer,
             self.scheduler,
             epoch,
             step,
-            extra={"config": self.cfg},
+            extra={
+                "config": self.cfg,
+                "validation_loss": validation_loss,
+                "best_validation_loss": self.best_validation_loss,
+                "checkpoint_type": checkpoint_type,
+                "plotter_state": self.plotter.state_dict(),
+            },
         )
 
 

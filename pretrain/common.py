@@ -6,6 +6,10 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,7 +20,7 @@ from transformers import BertConfig, BertModel
 @dataclass
 class OptimConfig:
     epochs: int = 10
-    batch_size: int = 64
+    batch_size: int = 128
     lr: float = 1e-4
     weight_decay: float = 0.01
     warmup_steps: int = 100
@@ -96,6 +100,59 @@ def save_checkpoint(
     if extra:
         payload.update(extra)
     torch.save(payload, path)
+
+
+class LossPlotter:
+    def __init__(self, path: str, title: str):
+        self.path = path
+        self.title = title
+        self.train_steps: list[int] = []
+        self.train_losses: list[float] = []
+        self.validation_steps: list[int] = []
+        self.validation_losses: list[float] = []
+
+    def add_train(self, step: int, loss: float) -> None:
+        self.train_steps.append(step)
+        self.train_losses.append(loss)
+
+    def add_validation(self, step: int, loss: float) -> None:
+        self.validation_steps.append(step)
+        self.validation_losses.append(loss)
+
+    def state_dict(self) -> dict:
+        return {
+            "train_steps": self.train_steps,
+            "train_losses": self.train_losses,
+            "validation_steps": self.validation_steps,
+            "validation_losses": self.validation_losses,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        self.train_steps = list(state.get("train_steps", []))
+        self.train_losses = list(state.get("train_losses", []))
+        self.validation_steps = list(state.get("validation_steps", []))
+        self.validation_losses = list(state.get("validation_losses", []))
+
+    def save(self) -> None:
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(self.train_steps, self.train_losses, label="train loss", linewidth=1.2)
+        if self.validation_steps:
+            ax.plot(
+                self.validation_steps,
+                self.validation_losses,
+                label="validation loss",
+                marker="o",
+                linewidth=1.8,
+            )
+        ax.set_xlabel("step")
+        ax.set_ylabel("loss")
+        ax.set_title(self.title)
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(self.path, dpi=160)
+        plt.close(fig)
 
 
 class ProjectionMLP(nn.Module):
