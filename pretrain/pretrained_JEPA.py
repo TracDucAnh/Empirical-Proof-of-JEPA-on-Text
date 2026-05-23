@@ -42,12 +42,54 @@ class JEPAPretrainConfig:
     output_dir: str = os.path.join(PROJECT_ROOT, "outputs", "text_jepa")
     checkpoint_name: str = "text_jepa_latest.pt"
     hidden_dim: int = 768
+    predictor_dim: int = 384
+    predictor_layers: int = 4
+    predictor_heads: int = 6
+    predictor_ffn_dim: int = 1536
     max_span_length: int = 5
     lambda_sent: float = 1.0
     lambda_span: float = 1.0
     ema_decay: float = 0.996
     use_span_loss: bool = True
     device: str = "auto"
+
+
+class NarrowTransformerPredictor(nn.Module):
+    """Small transformer predictor, separate from the BERT context encoder."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        predictor_dim: int,
+        num_heads: int,
+        num_layers: int,
+        ffn_dim: int,
+        max_length: int,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.input_proj = nn.Linear(input_dim, predictor_dim)
+        self.position_embeddings = nn.Embedding(max_length, predictor_dim)
+        layer = nn.TransformerEncoderLayer(
+            d_model=predictor_dim,
+            nhead=num_heads,
+            dim_feedforward=ffn_dim,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(predictor_dim)
+        self.output_proj = nn.Linear(predictor_dim, input_dim)
+
+    def forward(self, hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = hidden.shape
+        positions = torch.arange(seq_len, device=hidden.device).unsqueeze(0).expand(batch_size, seq_len)
+        x = self.input_proj(hidden) + self.position_embeddings(positions)
+        padding_mask = attention_mask.eq(0)
+        x = self.encoder(x, src_key_padding_mask=padding_mask)
+        return self.output_proj(self.norm(x))
 
 
 class TextJEPA(nn.Module):
@@ -58,17 +100,14 @@ class TextJEPA(nn.Module):
         self.target_encoder = copy.deepcopy(self.context_encoder)
         self._freeze_target_encoder()
 
-        self.sent_predictor = nn.Sequential(
-            nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
-            nn.GELU(),
-            nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
+        self.predictor = NarrowTransformerPredictor(
+            input_dim=cfg.hidden_dim,
+            predictor_dim=cfg.predictor_dim,
+            num_heads=cfg.predictor_heads,
+            num_layers=cfg.predictor_layers,
+            ffn_dim=cfg.predictor_ffn_dim,
+            max_length=cfg.data.max_length,
         )
-        if cfg.use_span_loss:
-            self.span_predictor = nn.Sequential(
-                nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
-                nn.GELU(),
-                nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
-            )
 
     def _freeze_target_encoder(self) -> None:
         for parameter in self.target_encoder.parameters():
@@ -114,19 +153,19 @@ class TextJEPA(nn.Module):
                 batch["clean_token_type_ids"],
             )
 
-        masked_cls = masked_hidden[:, 0]
+        predicted_hidden = self.predictor(masked_hidden, batch["masked_attention_mask"])
+        pred_sent = predicted_hidden[:, 0]
         clean_cls = clean_hidden[:, 0]
         target_sent = clean_cls.detach()
-        pred_sent = self.sent_predictor(masked_cls)
         sent_loss = F.mse_loss(pred_sent, target_sent)
 
-        span_loss = masked_cls.new_zeros(())
+        span_loss = predicted_hidden.new_zeros(())
         target_span = None
         pred_span = None
         if self.use_span_loss:
             pooled_span = self.span_mean_pool(clean_hidden, batch["span_mask"])
             target_span = pooled_span.detach()
-            pred_span = self.span_predictor(masked_cls)
+            pred_span = self.span_mean_pool(predicted_hidden, batch["span_mask"])
             span_loss = F.mse_loss(pred_span, target_span)
 
         return {

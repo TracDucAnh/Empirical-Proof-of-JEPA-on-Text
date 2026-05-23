@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
+from transformers import BertModel
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
@@ -22,9 +23,8 @@ if PROJECT_ROOT not in sys.path:
 
 from pretrained_data_sampler import TextDataConfig, TwoViewSpanMaskCollator, build_pretrain_dataloaders, set_seed
 from pretrain.common import (
-    BertSentenceEncoder,
     OptimConfig,
-    ProjectionMLP,
+    build_bert_base_config,
     device_from_config,
     make_optimizer,
     make_scheduler,
@@ -41,8 +41,7 @@ class VICRegPretrainConfig:
     optim: OptimConfig = field(default_factory=OptimConfig)
     output_dir: str = os.path.join(PROJECT_ROOT, "outputs", "text_vicreg")
     checkpoint_name: str = "text_vicreg_latest.pt"
-    projector_hidden_dim: int = 2048
-    projector_out_dim: int = 256
+    expander_dim: int = 3072
     sim_coeff: float = 25.0
     std_coeff: float = 25.0
     cov_coeff: float = 1.0
@@ -50,15 +49,49 @@ class VICRegPretrainConfig:
     device: str = "auto"
 
 
+class BertMeanPoolEncoder(nn.Module):
+    def __init__(self, max_length: int):
+        super().__init__()
+        self.bert = BertModel(build_bert_base_config(max_length=max_length))
+
+    def forward(self, input_ids, attention_mask, token_type_ids):
+        output = self.bert(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            return_dict=True,
+        )
+        hidden = output.last_hidden_state
+        mask = attention_mask.unsqueeze(-1).float()
+        return (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+
+
+class VICRegExpander(nn.Module):
+    def __init__(self, input_dim: int = 768, expander_dim: int = 3072):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, expander_dim),
+            nn.BatchNorm1d(expander_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(expander_dim, expander_dim),
+            nn.BatchNorm1d(expander_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(expander_dim, expander_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 class TextVICReg(nn.Module):
     def __init__(self, cfg: VICRegPretrainConfig):
         super().__init__()
-        self.encoder = BertSentenceEncoder(max_length=cfg.data.max_length)
-        self.projector = ProjectionMLP(768, cfg.projector_hidden_dim, cfg.projector_out_dim)
+        self.encoder = BertMeanPoolEncoder(max_length=cfg.data.max_length)
+        self.expander = VICRegExpander(768, cfg.expander_dim)
 
     def forward_view(self, input_ids, attention_mask, token_type_ids):
-        cls = self.encoder(input_ids, attention_mask, token_type_ids)
-        return self.projector(cls)
+        pooled = self.encoder(input_ids, attention_mask, token_type_ids)
+        return self.expander(pooled)
 
     def forward(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor]:
         z1 = self.forward_view(
