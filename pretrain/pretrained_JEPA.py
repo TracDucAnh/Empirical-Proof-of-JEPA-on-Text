@@ -12,12 +12,13 @@ import os
 import copy
 import sys
 from dataclasses import dataclass, field
+from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
-from transformers import BertModel
+from transformers import BertConfig, BertModel
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
@@ -38,7 +39,7 @@ from pretrain.common import (
 
 @dataclass
 class JEPAPretrainConfig:
-    data: TextDataConfig = field(default_factory=TextDataConfig)
+    data: TextDataConfig = field(default_factory=lambda: TextDataConfig(max_length=256))
     optim: OptimConfig = field(default_factory=OptimConfig)
     output_dir: str = os.path.join(PROJECT_ROOT, "outputs", "text_jepa")
     checkpoint_name: str = "text_jepa_best.pt"
@@ -52,15 +53,16 @@ class JEPAPretrainConfig:
     predictor_heads: int = 6
     predictor_ffn_dim: int = 1536
     max_span_length: int = 5
-    lambda_sent: float = 1.0
+    max_num_spans: int = 5
+    min_num_spans: int = 5
+    mask_seed: Optional[int] = None
     lambda_span: float = 1.0
     ema_decay: float = 0.996
-    use_span_loss: bool = True
     device: str = "auto"
 
 
-class NarrowTransformerPredictor(nn.Module):
-    """Small transformer predictor, separate from the BERT context encoder."""
+class SmallBertPredictor(nn.Module):
+    """Smaller BERT-style predictor over token latents."""
 
     def __init__(
         self,
@@ -73,39 +75,62 @@ class NarrowTransformerPredictor(nn.Module):
         dropout: float = 0.1,
     ):
         super().__init__()
-        self.input_proj = nn.Linear(input_dim, predictor_dim)
-        self.position_embeddings = nn.Embedding(max_length, predictor_dim)
-        layer = nn.TransformerEncoderLayer(
-            d_model=predictor_dim,
-            nhead=num_heads,
-            dim_feedforward=ffn_dim,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
-        self.norm = nn.LayerNorm(predictor_dim)
-        self.output_proj = nn.Linear(predictor_dim, input_dim)
+        if predictor_dim % num_heads != 0:
+            raise ValueError("predictor_dim must be divisible by predictor_heads.")
 
-    def forward(self, hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len, _ = hidden.shape
-        positions = torch.arange(seq_len, device=hidden.device).unsqueeze(0).expand(batch_size, seq_len)
-        x = self.input_proj(hidden) + self.position_embeddings(positions)
-        padding_mask = attention_mask.eq(0)
-        x = self.encoder(x, src_key_padding_mask=padding_mask)
-        return self.output_proj(self.norm(x))
+        self.input_proj = nn.Linear(input_dim, predictor_dim)
+        predictor_config = BertConfig(
+            vocab_size=1,
+            hidden_size=predictor_dim,
+            num_hidden_layers=num_layers,
+            num_attention_heads=num_heads,
+            intermediate_size=ffn_dim,
+            hidden_act="gelu",
+            hidden_dropout_prob=dropout,
+            attention_probs_dropout_prob=dropout,
+            max_position_embeddings=max_length,
+            type_vocab_size=2,
+            initializer_range=0.02,
+            layer_norm_eps=1e-12,
+            pad_token_id=0,
+            position_embedding_type="absolute",
+        )
+        self.bert = BertModel(predictor_config, add_pooling_layer=False)
+
+    def project(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.input_proj(hidden)
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        attention_mask: torch.Tensor,
+        token_type_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        output = self.bert(
+            inputs_embeds=self.project(hidden),
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            return_dict=True,
+        )
+        return output.last_hidden_state
 
 
 class TextJEPA(nn.Module):
     def __init__(self, cfg: JEPAPretrainConfig):
         super().__init__()
-        self.use_span_loss = cfg.use_span_loss
-        self.context_encoder = BertModel(build_bert_base_config(max_length=cfg.data.max_length))
+        encoder_config = build_bert_base_config(max_length=cfg.data.max_length)
+        if cfg.hidden_dim != encoder_config.hidden_size:
+            raise ValueError("hidden_dim must match the BERT encoder hidden size.")
+        if cfg.predictor_dim != encoder_config.hidden_size // 2:
+            raise ValueError("predictor_dim must be D/2, where D is the BERT encoder hidden size.")
+        if cfg.predictor_layers >= encoder_config.num_hidden_layers:
+            raise ValueError("predictor_layers must be fewer than the BERT encoder layers.")
+
+        self.context_encoder = BertModel(encoder_config, add_pooling_layer=False)
         self.target_encoder = copy.deepcopy(self.context_encoder)
         self._freeze_target_encoder()
 
-        self.predictor = NarrowTransformerPredictor(
+        self.predictor = SmallBertPredictor(
             input_dim=cfg.hidden_dim,
             predictor_dim=cfg.predictor_dim,
             num_heads=cfg.predictor_heads,
@@ -158,27 +183,20 @@ class TextJEPA(nn.Module):
                 batch["clean_token_type_ids"],
             )
 
-        predicted_hidden = self.predictor(masked_hidden, batch["masked_attention_mask"])
-        pred_sent = predicted_hidden[:, 0]
-        clean_cls = clean_hidden[:, 0]
-        target_sent = clean_cls.detach()
-        sent_loss = F.mse_loss(pred_sent, target_sent)
-
-        span_loss = predicted_hidden.new_zeros(())
-        target_span = None
-        pred_span = None
-        if self.use_span_loss:
-            pooled_span = self.span_mean_pool(clean_hidden, batch["span_mask"])
-            target_span = pooled_span.detach()
-            pred_span = self.span_mean_pool(predicted_hidden, batch["span_mask"])
-            span_loss = F.mse_loss(pred_span, target_span)
+        predicted_hidden = self.predictor(
+            masked_hidden,
+            batch["masked_attention_mask"],
+            batch["masked_token_type_ids"],
+        )
+        with torch.no_grad():
+            target_hidden = self.predictor.project(clean_hidden)
+        target_span = self.span_mean_pool(target_hidden, batch["span_mask"]).detach()
+        pred_span = self.span_mean_pool(predicted_hidden, batch["span_mask"])
+        span_loss = F.mse_loss(pred_span, target_span)
 
         return {
-            "target_sent": target_sent,
-            "pred_sent": pred_sent,
             "target_span": target_span,
             "pred_span": pred_span,
-            "sent_loss": sent_loss,
             "span_loss": span_loss,
         }
 
@@ -189,11 +207,23 @@ class JEPAPretrainer:
         set_seed(cfg.data.seed)
         self.device = device_from_config(cfg.device)
         self.model = TextJEPA(cfg).to(self.device)
-        collator = JEPASpanMaskCollator(max_span_length=cfg.max_span_length, seed=cfg.data.seed)
+        train_collator = JEPASpanMaskCollator(
+            max_span_length=cfg.max_span_length,
+            max_num_spans=cfg.max_num_spans,
+            min_num_spans=cfg.min_num_spans,
+            seed=cfg.mask_seed,
+        )
+        validation_collator = JEPASpanMaskCollator(
+            max_span_length=cfg.max_span_length,
+            max_num_spans=cfg.max_num_spans,
+            min_num_spans=cfg.min_num_spans,
+            seed=cfg.mask_seed,
+        )
         self.train_loader, self.validation_loader = build_pretrain_dataloaders(
             cfg.data,
             batch_size=cfg.optim.batch_size,
-            collate_fn=collator,
+            collate_fn=train_collator,
+            validation_collate_fn=validation_collator,
             num_workers=cfg.optim.num_workers,
         )
         self.optimizer = make_optimizer(self.model, cfg.optim)
@@ -209,12 +239,9 @@ class JEPAPretrainer:
             self.load_latest_if_available()
 
     def objective(self, output: dict) -> tuple[torch.Tensor, dict]:
-        loss = self.cfg.lambda_sent * output["sent_loss"]
-        if self.cfg.use_span_loss:
-            loss = loss + self.cfg.lambda_span * output["span_loss"]
+        loss = self.cfg.lambda_span * output["span_loss"]
         stats = {
             "loss": float(loss.detach()),
-            "sent": float(output["sent_loss"].detach()),
             "span": float(output["span_loss"].detach()),
         }
         return loss, stats
@@ -233,7 +260,7 @@ class JEPAPretrainer:
     @torch.no_grad()
     def evaluate(self) -> dict:
         self.model.eval()
-        totals = {"loss": 0.0, "sent": 0.0, "span": 0.0}
+        totals = {"loss": 0.0, "span": 0.0}
         count = 0
         for batch in self.validation_loader:
             batch = move_to_device(batch, self.device)

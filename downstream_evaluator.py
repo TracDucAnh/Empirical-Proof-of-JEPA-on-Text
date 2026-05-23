@@ -4,8 +4,9 @@ Protocol:
     1. Choose a pretrained method checkpoint.
     2. Load that method's encoder/backbone.
     3. Freeze every backbone parameter.
-    4. Train only the downstream task head on that task's train split.
-    5. Evaluate on that task's test/eval split.
+    4. Mean-pool token embeddings for sequence-level tasks.
+    5. Train only the downstream task head on that task's train split.
+    6. Evaluate on that task's test/eval split.
 
 Pretraining data is never used here.  Each downstream task owns its train/test
 data through `downstream_data_downloader.py`.
@@ -138,9 +139,18 @@ def load_pretrained_bert_backbone(
 
 
 class FrozenBackbone(nn.Module):
-    def __init__(self, backbone: nn.Module):
+    def __init__(
+        self,
+        backbone: nn.Module,
+        cls_token_id: int = 101,
+        sep_token_id: int = 102,
+        pad_token_id: int = 0,
+    ):
         super().__init__()
         self.backbone = backbone
+        self.cls_token_id = cls_token_id
+        self.sep_token_id = sep_token_id
+        self.pad_token_id = pad_token_id
 
     @torch.no_grad()
     def hidden_states(self, input_ids, attention_mask, token_type_ids=None) -> torch.Tensor:
@@ -152,9 +162,22 @@ class FrozenBackbone(nn.Module):
         )
         return output.last_hidden_state
 
+    def token_pool_mask(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        valid = attention_mask.bool()
+        special = (
+            input_ids.eq(self.cls_token_id)
+            | input_ids.eq(self.sep_token_id)
+            | input_ids.eq(self.pad_token_id)
+        )
+        token_mask = valid & ~special
+        empty = token_mask.sum(dim=1, keepdim=True).eq(0)
+        return torch.where(empty, valid, token_mask)
+
     @torch.no_grad()
-    def cls(self, input_ids, attention_mask, token_type_ids=None) -> torch.Tensor:
-        return self.hidden_states(input_ids, attention_mask, token_type_ids)[:, 0]
+    def mean_pool(self, input_ids, attention_mask, token_type_ids=None) -> torch.Tensor:
+        hidden = self.hidden_states(input_ids, attention_mask, token_type_ids)
+        mask = self.token_pool_mask(input_ids, attention_mask).unsqueeze(-1).float()
+        return (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
 
 
 class LinearClassificationHead(nn.Module):
@@ -209,7 +232,7 @@ class ClassificationEvaluator:
             pbar = tqdm(loader, desc=f"classification head epoch {epoch + 1}", ncols=120)
             for batch in pbar:
                 batch = move_to_device(batch, self.device)
-                features = self.backbone.cls(
+                features = self.backbone.mean_pool(
                     batch["input_ids"],
                     batch["attention_mask"],
                     batch.get("token_type_ids"),
@@ -230,7 +253,7 @@ class ClassificationEvaluator:
         total_loss = 0.0
         for batch in loader:
             batch = move_to_device(batch, self.device)
-            features = self.backbone.cls(
+            features = self.backbone.mean_pool(
                 batch["input_ids"],
                 batch["attention_mask"],
                 batch.get("token_type_ids"),
@@ -361,8 +384,8 @@ class RetrievalEvaluator:
         self.data = RetrievalEvaluationDataModule(self.data_cfg)
         self.optimizer = AdamW(self.head.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
-    def encode_cls(self, input_ids, attention_mask, token_type_ids=None) -> torch.Tensor:
-        return self.backbone.cls(input_ids, attention_mask, token_type_ids)
+    def encode_text(self, input_ids, attention_mask, token_type_ids=None) -> torch.Tensor:
+        return self.backbone.mean_pool(input_ids, attention_mask, token_type_ids)
 
     def train(self) -> None:
         loader = self.data.train_pair_dataloader()
@@ -371,12 +394,12 @@ class RetrievalEvaluator:
             pbar = tqdm(loader, desc=f"retrieval head epoch {epoch + 1}", ncols=120)
             for batch in pbar:
                 batch = move_to_device(batch, self.device)
-                q = self.head(self.encode_cls(
+                q = self.head(self.encode_text(
                     batch["query_input_ids"],
                     batch["query_attention_mask"],
                     batch.get("query_token_type_ids"),
                 ))
-                d = self.head(self.encode_cls(
+                d = self.head(self.encode_text(
                     batch["document_input_ids"],
                     batch["document_attention_mask"],
                     batch.get("document_token_type_ids"),
@@ -403,12 +426,12 @@ class RetrievalEvaluator:
                 return_tensors="pt",
             )
             encoded = move_to_device(encoded, self.device)
-            cls = self.encode_cls(
+            features = self.encode_text(
                 encoded["input_ids"],
                 encoded["attention_mask"],
                 encoded.get("token_type_ids"),
             )
-            embeddings.append(self.head(cls).detach().cpu())
+            embeddings.append(self.head(features).detach().cpu())
         return torch.cat(embeddings, dim=0) if embeddings else torch.empty(0, 256)
 
     @staticmethod

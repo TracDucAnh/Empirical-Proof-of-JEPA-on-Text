@@ -507,34 +507,107 @@ class TwoViewSpanMaskCollator:
 
 
 class JEPASpanMaskCollator:
-    """Create a clean sentence view and one span-masked prediction view."""
+    """Create clean and multi-span masked views for Text-JEPA."""
 
-    def __init__(self, max_span_length: int = 5, seed: int = 42):
-        self.masker = SpanMasker(max_span_length=max_span_length)
-        self.seed = seed
-        self.calls = 0
+    def __init__(
+        self,
+        max_span_length: int = 5,
+        max_num_spans: int = 5,
+        min_num_spans: int = 5,
+        mask_token_id: int = 103,
+        sep_token_id: int = 102,
+        cls_token_id: int = 101,
+        pad_token_id: int = 0,
+        seed: Optional[int] = None,
+    ):
+        if min_num_spans < 1:
+            raise ValueError("min_num_spans must be at least 1.")
+        if max_num_spans < min_num_spans:
+            raise ValueError("max_num_spans must be greater than or equal to min_num_spans.")
+        if max_span_length < 1:
+            raise ValueError("max_span_length must be at least 1.")
+
+        self.max_span_length = max_span_length
+        self.max_num_spans = max_num_spans
+        self.min_num_spans = min_num_spans
+        self.mask_token_id = mask_token_id
+        self.sep_token_id = sep_token_id
+        self.cls_token_id = cls_token_id
+        self.pad_token_id = pad_token_id
+        self.rng = random.Random(seed)
+
+    def _get_valid_positions(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> List[int]:
+        special_ids = {self.cls_token_id, self.sep_token_id, self.pad_token_id}
+        return [
+            idx
+            for idx in range(input_ids.size(0))
+            if int(input_ids[idx]) not in special_ids and int(attention_mask[idx]) == 1
+        ]
+
+    def _sample_spans(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> List[Tuple[int, int]]:
+        available = self._get_valid_positions(input_ids, attention_mask)
+        if not available:
+            return [(1, 1)]
+
+        n_spans = self.rng.randint(self.min_num_spans, self.max_num_spans)
+        available_set = set(available)
+        masked_positions: set[int] = set()
+        spans: List[Tuple[int, int]] = []
+
+        for _ in range(n_spans):
+            free = [position for position in available if position not in masked_positions]
+            if not free:
+                break
+
+            span_len = self.rng.randint(1, min(self.max_span_length, len(free)))
+            valid_starts = [
+                position
+                for position in free
+                if all(
+                    (position + offset) in available_set
+                    and (position + offset) not in masked_positions
+                    for offset in range(span_len)
+                )
+            ]
+            if not valid_starts:
+                break
+
+            start = self.rng.choice(valid_starts)
+            end = start + span_len - 1
+            spans.append((start, end))
+            masked_positions.update(range(start, end + 1))
+
+        return spans if spans else [(available[0], available[0])]
 
     def __call__(self, examples: List[dict]) -> dict:
         clean_input_ids = torch.stack([item["input_ids"] for item in examples])
         clean_attention_mask = torch.stack([item["attention_mask"] for item in examples])
         clean_token_type_ids = torch.stack([item["token_type_ids"] for item in examples])
 
-        masked_rows, span_masks = [], []
-        for row, ids in enumerate(clean_input_ids):
-            rng = random.Random(self.seed + self.calls * 1_000_003 + row)
-            masked, span_mask = self.masker.mask_one(ids, rng)
-            masked_rows.append(masked)
-            span_masks.append(span_mask)
+        masked_input_ids = clean_input_ids.clone()
+        span_masks = torch.zeros_like(clean_input_ids)
+        for row in range(clean_input_ids.size(0)):
+            spans = self._sample_spans(clean_input_ids[row], clean_attention_mask[row])
+            for start, end in spans:
+                masked_input_ids[row, start : end + 1] = self.mask_token_id
+                span_masks[row, start : end + 1] = 1
 
-        self.calls += 1
         return {
             "clean_input_ids": clean_input_ids,
             "clean_attention_mask": clean_attention_mask,
             "clean_token_type_ids": clean_token_type_ids,
-            "masked_input_ids": torch.stack(masked_rows),
+            "masked_input_ids": masked_input_ids,
             "masked_attention_mask": clean_attention_mask,
             "masked_token_type_ids": clean_token_type_ids,
-            "span_mask": torch.stack(span_masks),
+            "span_mask": span_masks,
         }
 
 
@@ -542,6 +615,7 @@ def build_pretrain_dataloaders(
     data_cfg: TextDataConfig,
     batch_size: int,
     collate_fn,
+    validation_collate_fn=None,
     num_workers: int = 2,
     pin_memory: Optional[bool] = None,
     drop_last: bool = True,
@@ -567,7 +641,7 @@ def build_pretrain_dataloaders(
         num_workers=num_workers,
         pin_memory=pin,
         drop_last=False,
-        collate_fn=collate_fn,
+        collate_fn=validation_collate_fn or collate_fn,
     )
     return train_loader, validation_loader
 
