@@ -7,6 +7,10 @@ Protocol:
     4. Train only the downstream task head on that task's train split.
     5. Evaluate on that task's test/eval split.
 
+Results are saved to:
+    outputs/results/<task>_<method>_<timestamp>.json   — single-run detail
+    outputs/results/results.csv                        — appended summary row
+
 Pretraining data is never used here.  Each downstream task owns its train/test
 data through `downstream_data_downloader.py`.
 """
@@ -14,10 +18,13 @@ data through `downstream_data_downloader.py`.
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 import os
 import re
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional
 
 import torch
@@ -34,10 +41,12 @@ if PROJECT_ROOT not in sys.path:
 from downstream_data_downloader import (
     ClassificationDataConfig,
     ClassificationEvaluationDataModule,
+    NLIEvaluationDataModule,
     QADataConfig,
     QAEvaluationDataModule,
     RetrievalDataConfig,
     RetrievalEvaluationDataModule,
+    SNLIDataConfig,
 )
 from pretrain.common import build_bert_base_config, device_from_config, move_to_device
 from pretrain.pretrained_Barlow_Twins import BarlowTwinsPretrainConfig, TextBarlowTwins
@@ -48,6 +57,63 @@ from pretrain.pretrained_BERT import BERTPretrainConfig
 
 METHODS = {"bert", "jepa", "byol", "vicreg", "barlow_twins"}
 
+RESULTS_DIR = os.path.join(PROJECT_ROOT, "outputs", "results")
+CSV_PATH = os.path.join(RESULTS_DIR, "results.csv")
+
+
+# ---------------------------------------------------------------------------
+# Result persistence helpers
+# ---------------------------------------------------------------------------
+
+def save_results(
+    metrics: dict,
+    cfg: "DownstreamTrainConfig",
+    timestamp: str,
+) -> None:
+    """Write metrics to a per-run JSON file and append a row to the shared CSV."""
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+
+    # --- JSON (full detail) -------------------------------------------------
+    payload = {
+        "timestamp": timestamp,
+        "method": cfg.method,
+        "task": cfg.task,
+        "checkpoint": cfg.checkpoint_path,
+        "epochs": cfg.epochs,
+        "lr": cfg.lr,
+        "weight_decay": cfg.weight_decay,
+        "metrics": metrics,
+    }
+    json_name = f"{cfg.task}_{cfg.method}_{timestamp}.json"
+    json_path = os.path.join(RESULTS_DIR, json_name)
+    with open(json_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    print(f"[results] JSON saved → {json_path}")
+
+    # --- CSV (appended summary row) -----------------------------------------
+    # Flatten metrics into top-level columns so the CSV stays human-readable.
+    row: dict = {
+        "timestamp": timestamp,
+        "method": cfg.method,
+        "task": cfg.task,
+        "epochs": cfg.epochs,
+        "lr": cfg.lr,
+        **{f"metric_{k}": v for k, v in metrics.items()},
+        "checkpoint": cfg.checkpoint_path,
+    }
+
+    file_exists = os.path.isfile(CSV_PATH)
+    with open(CSV_PATH, "a", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(row.keys()), extrasaction="ignore")
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+    print(f"[results] CSV  row  → {CSV_PATH}")
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint / backbone utilities
+# ---------------------------------------------------------------------------
 
 @dataclass
 class DownstreamTrainConfig:
@@ -137,6 +203,10 @@ def load_pretrained_bert_backbone(
     return freeze(backbone.to(device))
 
 
+# ---------------------------------------------------------------------------
+# Shared backbone wrapper
+# ---------------------------------------------------------------------------
+
 class FrozenBackbone(nn.Module):
     def __init__(self, backbone: nn.Module):
         super().__init__()
@@ -156,6 +226,10 @@ class FrozenBackbone(nn.Module):
     def cls(self, input_ids, attention_mask, token_type_ids=None) -> torch.Tensor:
         return self.hidden_states(input_ids, attention_mask, token_type_ids)[:, 0]
 
+
+# ---------------------------------------------------------------------------
+# Task heads
+# ---------------------------------------------------------------------------
 
 class LinearClassificationHead(nn.Module):
     def __init__(self, hidden_dim: int = 768, num_labels: int = 2):
@@ -185,6 +259,10 @@ class RetrievalProjectionHead(nn.Module):
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         return F.normalize(self.proj(features), dim=-1)
 
+
+# ---------------------------------------------------------------------------
+# Evaluators
+# ---------------------------------------------------------------------------
 
 class ClassificationEvaluator:
     def __init__(self, cfg: DownstreamTrainConfig):
@@ -228,9 +306,9 @@ class ClassificationEvaluator:
         correct = 0
         total = 0
         total_loss = 0.0
-        tp = 0  # true  positives  (pred=1, label=1)
-        fp = 0  # false positives  (pred=1, label=0)
-        fn = 0  # false negatives  (pred=0, label=1)
+        tp = 0
+        fp = 0
+        fn = 0
         for batch in loader:
             batch = move_to_device(batch, self.device)
             features = self.backbone.cls(
@@ -257,6 +335,112 @@ class ClassificationEvaluator:
             "recall":    recall,
             "loss":      total_loss / max(1, len(loader)),
         }
+
+
+class NLIEvaluator:
+    """Frozen-backbone evaluator for Stanford NLI (3-way classification).
+
+    Uses the [CLS] token from a sentence-pair encoding of
+    (premise, hypothesis).  Only the linear head is trained.
+
+    Metrics
+    -------
+    accuracy        fraction of test examples classified correctly
+    f1_macro        macro-averaged F1 across entailment / neutral / contradiction
+    precision_*     per-class precision
+    recall_*        per-class recall
+    f1_*            per-class F1
+    loss            mean cross-entropy over the test set
+    """
+
+    LABEL_NAMES = ("entailment", "neutral", "contradiction")
+
+    def __init__(self, cfg: DownstreamTrainConfig):
+        self.cfg = cfg
+        self.data_cfg = SNLIDataConfig()
+        self.device = device_from_config(cfg.device)
+        backbone = load_pretrained_bert_backbone(
+            cfg.method,
+            cfg.checkpoint_path,
+            self.data_cfg.max_length,
+            self.device,
+        )
+        self.backbone = FrozenBackbone(backbone)
+        self.head = LinearClassificationHead(
+            hidden_dim=768, num_labels=self.data_cfg.num_labels
+        ).to(self.device)
+        self.data = NLIEvaluationDataModule(self.data_cfg)
+        self.optimizer = AdamW(
+            self.head.parameters(),
+            lr=cfg.lr,
+            weight_decay=cfg.weight_decay,
+        )
+
+    def train(self) -> None:
+        loader = self.data.train_dataloader()
+        self.head.train()
+        for epoch in range(self.cfg.epochs):
+            pbar = tqdm(loader, desc=f"nli head epoch {epoch + 1}", ncols=120)
+            for batch in pbar:
+                batch = move_to_device(batch, self.device)
+                features = self.backbone.cls(
+                    batch["input_ids"],
+                    batch["attention_mask"],
+                    batch.get("token_type_ids"),
+                )
+                logits = self.head(features)
+                loss = F.cross_entropy(logits, batch["labels"])
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+                pbar.set_postfix({"loss": f"{float(loss.detach()):.4f}"})
+
+    @torch.no_grad()
+    def evaluate(self) -> dict:
+        loader = self.data.test_dataloader()
+        self.head.eval()
+
+        num_labels = self.data_cfg.num_labels
+        correct = 0
+        total = 0
+        total_loss = 0.0
+        tp = [0] * num_labels
+        fp = [0] * num_labels
+        fn = [0] * num_labels
+
+        for batch in loader:
+            batch = move_to_device(batch, self.device)
+            features = self.backbone.cls(
+                batch["input_ids"],
+                batch["attention_mask"],
+                batch.get("token_type_ids"),
+            )
+            logits = self.head(features)
+            total_loss += float(F.cross_entropy(logits, batch["labels"]).item())
+            pred   = logits.argmax(dim=-1)
+            labels = batch["labels"]
+            correct += int((pred == labels).sum().item())
+            total   += int(labels.numel())
+            for cls_idx in range(num_labels):
+                tp[cls_idx] += int(((pred == cls_idx) & (labels == cls_idx)).sum().item())
+                fp[cls_idx] += int(((pred == cls_idx) & (labels != cls_idx)).sum().item())
+                fn[cls_idx] += int(((pred != cls_idx) & (labels == cls_idx)).sum().item())
+
+        metrics: dict = {
+            "accuracy": correct / max(1, total),
+            "loss": total_loss / max(1, len(loader)),
+        }
+        f1_scores = []
+        for cls_idx, name in enumerate(self.LABEL_NAMES):
+            precision = tp[cls_idx] / max(1, tp[cls_idx] + fp[cls_idx])
+            recall    = tp[cls_idx] / max(1, tp[cls_idx] + fn[cls_idx])
+            f1        = 2 * precision * recall / max(1e-8, precision + recall)
+            metrics[f"precision_{name}"] = precision
+            metrics[f"recall_{name}"]    = recall
+            metrics[f"f1_{name}"]        = f1
+            f1_scores.append(f1)
+        metrics["f1_macro"] = sum(f1_scores) / len(f1_scores)
+        return metrics
 
 
 def normalize_answer(text: str) -> str:
@@ -507,9 +691,15 @@ class RetrievalEvaluator:
         }
 
 
+# ---------------------------------------------------------------------------
+# Factory + entry point
+# ---------------------------------------------------------------------------
+
 def build_evaluator(cfg: DownstreamTrainConfig):
     if cfg.task == "classification":
         return ClassificationEvaluator(cfg)
+    if cfg.task == "nli":
+        return NLIEvaluator(cfg)
     if cfg.task == "qa":
         return QAEvaluator(cfg)
     if cfg.task == "retrieval":
@@ -519,7 +709,7 @@ def build_evaluator(cfg: DownstreamTrainConfig):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Frozen-backbone downstream evaluation.")
-    parser.add_argument("--task", choices=["classification", "qa", "retrieval"], required=True)
+    parser.add_argument("--task", choices=["classification", "nli", "qa", "retrieval"], required=True)
     parser.add_argument("--method", choices=sorted(METHODS), required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--epochs", type=int, default=5)
@@ -541,10 +731,14 @@ def main() -> None:
         max_eval_queries=args.max_eval_queries,
         max_eval_corpus=args.max_eval_corpus,
     )
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     evaluator = build_evaluator(cfg)
     evaluator.train()
     metrics = evaluator.evaluate()
+
     print(metrics)
+    save_results(metrics, cfg, timestamp)
 
 
 if __name__ == "__main__":

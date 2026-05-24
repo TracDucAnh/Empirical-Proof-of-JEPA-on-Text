@@ -13,6 +13,12 @@ Tasks currently covered:
        `mteb/fever`.
        Configs: default qrels, corpus documents, queries.
        Splits: qrels train -> train, qrels test -> test/eval.
+
+    4. Natural Language Inference:
+       `stanfordnlp/snli`.
+       Splits: train -> train, test -> test.
+       Labels: 0 = entailment, 1 = neutral, 2 = contradiction.
+       Examples with label == -1 (no majority agreement) are filtered out.
 """
 
 from __future__ import annotations
@@ -30,6 +36,10 @@ from transformers import BertTokenizerFast
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
+
+# ---------------------------------------------------------------------------
+# 1. Sentiment Classification — IMDB
+# ---------------------------------------------------------------------------
 
 @dataclass
 class ClassificationDataConfig:
@@ -146,6 +156,10 @@ class ClassificationEvaluationDataModule:
             collate_fn=self.collator,
         )
 
+
+# ---------------------------------------------------------------------------
+# 2. Extractive Question Answering — SQuAD
+# ---------------------------------------------------------------------------
 
 @dataclass
 class QADataConfig:
@@ -359,6 +373,10 @@ class QAEvaluationDataModule:
         )
 
 
+# ---------------------------------------------------------------------------
+# 3. Information Retrieval — MTEB FEVER
+# ---------------------------------------------------------------------------
+
 @dataclass
 class RetrievalDataConfig:
     dataset_name: str = "mteb/fever"
@@ -571,11 +589,137 @@ class RetrievalEvaluationDataModule:
         )
 
 
+# ---------------------------------------------------------------------------
+# 4. Natural Language Inference — Stanford NLI (SNLI)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SNLIDataConfig:
+    dataset_name: str = "stanfordnlp/snli"
+    train_split: str = "train"
+    test_split: str = "test"
+    cache_dir: str = os.path.join(PROJECT_ROOT, "downstream_cache", "snli")
+    tokenizer_name: str = "bert-base-uncased"
+    max_length: int = 128
+    batch_size: int = 64
+    num_workers: int = 2
+    seed: int = 42
+    # 0 = entailment, 1 = neutral, 2 = contradiction; -1 = unannotated (filtered)
+    num_labels: int = 3
+    label_names: tuple = ("entailment", "neutral", "contradiction")
+
+
+class SNLIDataDownloader:
+    """Download and cache SNLI train / test splits for NLI."""
+
+    required_columns = {"premise", "hypothesis", "label"}
+
+    def __init__(self, cfg: SNLIDataConfig):
+        self.cfg = cfg
+
+    def _filter_unlabeled(self, split):
+        """Remove examples whose label is -1 (no majority agreement)."""
+        return split.filter(lambda example: example["label"] != -1)
+
+    def download(self) -> DatasetDict:
+        train = load_dataset(self.cfg.dataset_name, split=self.cfg.train_split)
+        test = load_dataset(self.cfg.dataset_name, split=self.cfg.test_split)
+        train = self._filter_unlabeled(train)
+        test = self._filter_unlabeled(test)
+        dataset = DatasetDict({"train": train, "test": test})
+        self.validate(dataset)
+        return dataset
+
+    def validate(self, dataset: DatasetDict) -> None:
+        for split_name, split in dataset.items():
+            missing = self.required_columns.difference(split.column_names)
+            if missing:
+                raise ValueError(f"{split_name} split is missing columns: {sorted(missing)}")
+
+    def load_or_download(self) -> DatasetDict:
+        if os.path.isdir(self.cfg.cache_dir):
+            dataset = load_from_disk(self.cfg.cache_dir)
+            self.validate(dataset)
+            return dataset
+        dataset = self.download()
+        os.makedirs(os.path.dirname(self.cfg.cache_dir), exist_ok=True)
+        dataset.save_to_disk(self.cfg.cache_dir)
+        return dataset
+
+
+class SNLICollator:
+    """Tokenize (premise, hypothesis) pairs for BERT-style NLI classification."""
+
+    def __init__(self, tokenizer_name: str, max_length: int):
+        self.tokenizer = BertTokenizerFast.from_pretrained(tokenizer_name)
+        self.max_length = max_length
+
+    def __call__(self, examples: list[dict]) -> dict:
+        premises = [item["premise"] for item in examples]
+        hypotheses = [item["hypothesis"] for item in examples]
+        encoded = self.tokenizer(
+            premises,
+            hypotheses,
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+        encoded["labels"] = torch.tensor(
+            [int(item["label"]) for item in examples], dtype=torch.long
+        )
+        return encoded
+
+
+class NLIEvaluationDataModule:
+    """Data module for downstream SNLI natural-language-inference evaluation."""
+
+    def __init__(self, cfg: Optional[SNLIDataConfig] = None):
+        self.cfg = cfg or SNLIDataConfig()
+        self.downloader = SNLIDataDownloader(self.cfg)
+        self.collator = SNLICollator(
+            tokenizer_name=self.cfg.tokenizer_name,
+            max_length=self.cfg.max_length,
+        )
+
+    def datasets(self) -> DatasetDict:
+        return self.downloader.load_or_download()
+
+    def train_dataloader(self) -> DataLoader:
+        dataset = self.datasets()["train"]
+        generator = torch.Generator()
+        generator.manual_seed(self.cfg.seed)
+        return DataLoader(
+            dataset,
+            batch_size=self.cfg.batch_size,
+            shuffle=True,
+            num_workers=self.cfg.num_workers,
+            pin_memory=torch.cuda.is_available(),
+            collate_fn=self.collator,
+            generator=generator,
+        )
+
+    def test_dataloader(self) -> DataLoader:
+        dataset = self.datasets()["test"]
+        return DataLoader(
+            dataset,
+            batch_size=self.cfg.batch_size,
+            shuffle=False,
+            num_workers=self.cfg.num_workers,
+            pin_memory=torch.cuda.is_available(),
+            collate_fn=self.collator,
+        )
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Download downstream evaluation datasets.")
     parser.add_argument(
         "--task",
-        choices=["classification", "imdb", "qa", "retrieval", "ir", "all"],
+        choices=["classification", "imdb", "qa", "retrieval", "ir", "nli", "snli", "all"],
         default="all",
     )
     args = parser.parse_args()
@@ -611,6 +755,16 @@ def main() -> None:
         print(f"FEVER corpus columns: {retrieval_dataset['corpus'].column_names}")
         print(f"FEVER queries columns: {retrieval_dataset['queries'].column_names}")
         print(f"FEVER cache: {retrieval_cfg.cache_dir}")
+
+    if args.task in {"nli", "snli", "all"}:
+        nli_cfg = SNLIDataConfig()
+        nli_module = NLIEvaluationDataModule(nli_cfg)
+        nli_dataset = nli_module.datasets()
+        print(f"SNLI train rows: {len(nli_dataset['train']):,}")
+        print(f"SNLI test  rows: {len(nli_dataset['test']):,}")
+        print(f"SNLI columns   : {nli_dataset['train'].column_names}")
+        print(f"SNLI labels    : {nli_cfg.label_names}")
+        print(f"SNLI cache     : {nli_cfg.cache_dir}")
 
 
 if __name__ == "__main__":

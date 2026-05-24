@@ -110,6 +110,16 @@ python downstream_evaluator.py --task qa --method bert --checkpoint outputs/bert
 python downstream_evaluator.py --task retrieval --method bert --checkpoint outputs/bert_pretraining/bert_pretraining_best.pt --epochs 5 --retrieval-eval-k 10
 ```
 
+### SNLI
+
+```bash
+python downstream_evaluator.py \
+    --task nli \
+    --method bert \
+    --checkpoint outputs/bert_pretraining/bert_pretraining_best.pt \
+    --epochs 5
+```
+
 ## 7. Evaluate JEPA
 
 ### Classification
@@ -128,6 +138,16 @@ python downstream_evaluator.py --task qa --method jepa --checkpoint outputs/text
 
 ```bash
 python downstream_evaluator.py --task retrieval --method jepa --checkpoint outputs/text_jepa/text_jepa_best.pt --epochs 5 --retrieval-eval-k 10
+```
+
+### SNLI
+
+```bash
+python downstream_evaluator.py \
+    --task nli \
+    --method jepa \
+    --checkpoint outputs/text_jepa/text_jepa_best.pt \
+    --epochs 5
 ```
 
 ## 8. Evaluate BYOL
@@ -150,6 +170,16 @@ python downstream_evaluator.py --task qa --method byol --checkpoint outputs/text
 python downstream_evaluator.py --task retrieval --method byol --checkpoint outputs/text_byol/text_byol_best.pt --epochs 5 --retrieval-eval-k 10
 ```
 
+### SNLI
+
+```bash
+python downstream_evaluator.py \
+    --task nli \
+    --method byol \
+    --checkpoint outputs/text_byol/text_byol_best.pt \
+    --epochs 5
+```
+
 ## 9. Evaluate VICReg
 
 ### Classification
@@ -170,6 +200,16 @@ python downstream_evaluator.py --task qa --method vicreg --checkpoint outputs/te
 python downstream_evaluator.py --task retrieval --method vicreg --checkpoint outputs/text_vicreg/text_vicreg_best.pt --epochs 5 --retrieval-eval-k 10
 ```
 
+### SNLI
+
+```bash
+python downstream_evaluator.py \
+    --task nli \
+    --method vicreg \
+    --checkpoint outputs/text_vicreg/text_vicreg_best.pt \
+    --epochs 5
+```
+
 ## 10. Evaluate Barlow Twins
 
 ### Classification
@@ -188,4 +228,14 @@ python downstream_evaluator.py --task qa --method barlow_twins --checkpoint outp
 
 ```bash
 python downstream_evaluator.py --task retrieval --method barlow_twins --checkpoint outputs/text_barlow_twins/text_barlow_twins_best.pt --epochs 5 --retrieval-eval-k 10
+```
+
+### SNLI
+
+```bash
+python downstream_evaluator.py \
+    --task nli \
+    --method barlow_twins \
+    --checkpoint outputs/text_barlow_twins/text_barlow_twins_best.pt \
+    --epochs 5
 ```
