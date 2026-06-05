@@ -240,8 +240,11 @@ class FrozenBackbone(nn.Module):
         return output.last_hidden_state
 
     @torch.no_grad()
-    def cls(self, input_ids, attention_mask, token_type_ids=None) -> torch.Tensor:
-        return self.hidden_states(input_ids, attention_mask, token_type_ids)[:, 0]
+    def mean(self, input_ids, attention_mask, token_type_ids=None) -> torch.Tensor:
+        """Mean-pool over non-padding tokens: sum(h * mask) / sum(mask)."""
+        h = self.hidden_states(input_ids, attention_mask, token_type_ids)  # [B, L, D]
+        mask = attention_mask.unsqueeze(-1).float()                        # [B, L, 1]
+        return (h * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)    # [B, D]
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +304,7 @@ class ClassificationEvaluator:
             pbar = tqdm(loader, desc=f"classification head epoch {epoch + 1}", ncols=120)
             for batch in pbar:
                 batch = move_to_device(batch, self.device)
-                features = self.backbone.cls(
+                features = self.backbone.mean(
                     batch["input_ids"], batch["attention_mask"], batch.get("token_type_ids"),
                 )
                 logits = self.head(features)
@@ -320,7 +323,7 @@ class ClassificationEvaluator:
         tp = fp = fn = 0
         for batch in loader:
             batch = move_to_device(batch, self.device)
-            features = self.backbone.cls(
+            features = self.backbone.mean(
                 batch["input_ids"], batch["attention_mask"], batch.get("token_type_ids"),
             )
             logits = self.head(features)
@@ -366,7 +369,7 @@ class NLIEvaluator:
             pbar = tqdm(loader, desc=f"nli head epoch {epoch + 1}", ncols=120)
             for batch in pbar:
                 batch = move_to_device(batch, self.device)
-                features = self.backbone.cls(
+                features = self.backbone.mean(
                     batch["input_ids"], batch["attention_mask"], batch.get("token_type_ids"),
                 )
                 logits = self.head(features)
@@ -388,7 +391,7 @@ class NLIEvaluator:
         fn = [0] * num_labels
         for batch in loader:
             batch = move_to_device(batch, self.device)
-            features = self.backbone.cls(
+            features = self.backbone.mean(
                 batch["input_ids"], batch["attention_mask"], batch.get("token_type_ids"),
             )
             logits = self.head(features)
@@ -507,18 +510,16 @@ class QAEvaluator:
                 tensor_batch.get("token_type_ids"),
             )
             start_logits, end_logits = self.head(hidden)
-            # Move logits to CPU for per-example processing
             start_logits_cpu = start_logits.cpu()
             end_logits_cpu   = end_logits.cpu()
 
             batch_size = start_logits_cpu.size(0)
             for index in range(batch_size):
-                offsets = batch["offset_mapping"][index]   # List[Optional[tuple[int,int]]]
+                offsets = batch["offset_mapping"][index]
                 context = batch["contexts"][index]
                 answers = batch["answers"][index]["text"]
-                seq_len = len(offsets)                     # Bug 4 FIX: use list length
+                seq_len = len(offsets)                     # Bug 4 FIX
 
-                # Bug 3 FIX: collect valid context token positions
                 valid_positions = [
                     pos for pos in range(seq_len)
                     if offsets[pos] is not None
@@ -530,8 +531,6 @@ class QAEvaluator:
                     s_logits = start_logits_cpu[index]
                     e_logits = end_logits_cpu[index]
 
-                    # Best valid span: maximise s_logits[i] + e_logits[j]
-                    # with i <= j, both in valid_positions
                     best_score = float("-inf")
                     best_start = valid_positions[0]
                     best_end   = valid_positions[0]
@@ -576,8 +575,8 @@ class RetrievalEvaluator:
         self.data = RetrievalEvaluationDataModule(self.data_cfg)
         self.optimizer = AdamW(self.head.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
-    def encode_cls(self, input_ids, attention_mask, token_type_ids=None) -> torch.Tensor:
-        return self.backbone.cls(input_ids, attention_mask, token_type_ids)
+    def encode_mean(self, input_ids, attention_mask, token_type_ids=None) -> torch.Tensor:
+        return self.backbone.mean(input_ids, attention_mask, token_type_ids)
 
     def train(self) -> None:
         loader = self.data.train_pair_dataloader()
@@ -586,10 +585,10 @@ class RetrievalEvaluator:
             pbar = tqdm(loader, desc=f"retrieval head epoch {epoch + 1}", ncols=120)
             for batch in pbar:
                 batch = move_to_device(batch, self.device)
-                q = self.head(self.encode_cls(
+                q = self.head(self.encode_mean(
                     batch["query_input_ids"], batch["query_attention_mask"], batch.get("query_token_type_ids"),
                 ))
-                d = self.head(self.encode_cls(
+                d = self.head(self.encode_mean(
                     batch["document_input_ids"], batch["document_attention_mask"], batch.get("document_token_type_ids"),
                 ))
                 logits = (q @ d.t()) / self.cfg.retrieval_temperature
@@ -611,10 +610,10 @@ class RetrievalEvaluator:
                 max_length=max_length, return_tensors="pt",
             )
             encoded = move_to_device(encoded, self.device)
-            cls = self.encode_cls(
+            pooled = self.encode_mean(
                 encoded["input_ids"], encoded["attention_mask"], encoded.get("token_type_ids"),
             )
-            embeddings.append(self.head(cls).detach().cpu())
+            embeddings.append(self.head(pooled).detach().cpu())
         return torch.cat(embeddings, dim=0) if embeddings else torch.empty(0, 256)
 
     @staticmethod
@@ -641,7 +640,6 @@ class RetrievalEvaluator:
         relevant = self.relevant_documents(dataset["test"])
 
         query_index = {str(row["_id"]).strip('"'): index for index, row in enumerate(dataset["queries"])}
-        # Only keep query_ids that exist in the queries dataset
         query_ids = [qid for qid in relevant.keys() if qid in query_index]
         if self.cfg.max_eval_queries > 0:
             query_ids = query_ids[: self.cfg.max_eval_queries]
