@@ -11,17 +11,23 @@ Key design decisions mirroring I-JEPA:
 
 from __future__ import annotations
 
-import os
 import copy
+import os
 import sys
+import warnings
 from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from dotenv import load_dotenv
+from huggingface_hub import HfApi
 from tqdm import tqdm
 from transformers import BertConfig, BertModel
+
+# ── load .env ─────────────────────────────────────────────────────────────────
+load_dotenv()
+HF_TOKEN = os.getenv("HF_TOKEN")
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
@@ -31,7 +37,6 @@ from pretrained_data_sampler import JEPASpanMaskCollator, TextDataConfig, build_
 from pretrain.common import (
     LossPlotter,
     OptimConfig,
-    build_bert_base_config,
     device_from_config,
     make_optimizer,
     make_scheduler,
@@ -39,6 +44,42 @@ from pretrain.common import (
     save_checkpoint,
 )
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1.  Encoder configs  (mirrors tjepa_architecture.py)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_bert_base_config(max_length: int = 256) -> BertConfig:
+    return BertConfig(
+        vocab_size=30522, hidden_size=768, num_hidden_layers=12,
+        num_attention_heads=12, intermediate_size=3072, hidden_act="gelu",
+        hidden_dropout_prob=0.1, attention_probs_dropout_prob=0.1,
+        max_position_embeddings=max_length, type_vocab_size=2,
+        initializer_range=0.02, layer_norm_eps=1e-12, pad_token_id=0,
+        position_embedding_type="absolute",
+    )
+
+
+def build_bert_large_config(max_length: int = 256) -> BertConfig:
+    return BertConfig(
+        vocab_size=30522, hidden_size=1024, num_hidden_layers=24,
+        num_attention_heads=16, intermediate_size=4096, hidden_act="gelu",
+        hidden_dropout_prob=0.1, attention_probs_dropout_prob=0.1,
+        max_position_embeddings=max_length, type_vocab_size=2,
+        initializer_range=0.02, layer_norm_eps=1e-12, pad_token_id=0,
+        position_embedding_type="absolute",
+    )
+
+
+_ENCODER_CONFIGS: dict[str, callable] = {
+    "bert_base":  build_bert_base_config,
+    "bert_large": build_bert_large_config,
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2.  Config
+# ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class JEPAPretrainConfig:
@@ -50,103 +91,119 @@ class JEPAPretrainConfig:
     loss_plot_name: str = "text_jepa_loss.png"
     plot_every: int = 10
     resume_from_latest: bool = True
-    hidden_dim: int = 768        # D: encoder hidden size
-    predictor_dim: int = 384     # d: predictor internal bottleneck
+    # ── architecture ──────────────────────────────────────────────────────────
+    model_name: str = "bert_large"   # "bert_base" | "bert_large"
+    hidden_dim: int = 1024           # D: must match model_name (bert_large=1024)
+    predictor_dim: int = 512         # d: recommended D/2 = 512
     predictor_layers: int = 4
-    predictor_heads: int = 6
-    predictor_ffn_dim: int = 1536
+    predictor_heads: int = 8         # predictor_dim (512) % heads == 0
+    predictor_ffn_dim: int = 2048    # 4 * predictor_dim
+    # ── masking ───────────────────────────────────────────────────────────────
     max_span_length: int = 5
     max_num_spans: int = 5
     min_num_spans: int = 5
     mask_seed: Optional[int] = None
+    # ── EMA ───────────────────────────────────────────────────────────────────
     ema_decay: float = 0.996
     device: str = "auto"
+    # ── HuggingFace Hub ───────────────────────────────────────────────────────
+    hf_repo_id: str = "ducanhdinh/jepa_proof_tjepa"
+    push_to_hub: bool = True
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3.  Predictor  (unchanged — identical to tjepa_architecture.py)
+# ══════════════════════════════════════════════════════════════════════════════
 
 class SmallBertPredictor(nn.Module):
-    """Narrow BERT predictor that mirrors the I-JEPA predictor design.
-
-    Data flow:
-        [B, L, D]
-          → input_proj  Linear(D → d)
-          → BERT layers (hidden dim = d)
-          → output_proj Linear(d → D)
-        [B, L, D]
-
-    The bottleneck at d forces the predictor to compress context information,
-    preventing it from trivially copying the encoder output.
-    Input and output both live in encoder space D, so the loss is computed
-    directly against the (unprojected) target encoder output.
+    """Narrow BERT predictor: D → d (bottleneck) → D.
+    Input/output live in encoder space D; loss computed against target encoder.
     """
 
-    def __init__(
-        self,
-        input_dim: int,       # D
-        predictor_dim: int,   # d
-        num_heads: int,
-        num_layers: int,
-        ffn_dim: int,
-        max_length: int,
-        dropout: float = 0.1,
-    ):
+    def __init__(self, input_dim=768, predictor_dim=384, num_heads=6,
+                 num_layers=4, ffn_dim=1536, max_length=256, dropout=0.1):
         super().__init__()
         if predictor_dim % num_heads != 0:
-            raise ValueError("predictor_dim must be divisible by predictor_heads.")
+            raise ValueError(
+                f"predictor_dim ({predictor_dim}) must be divisible by "
+                f"num_heads ({num_heads}).")
 
-        self.input_proj = nn.Linear(input_dim, predictor_dim)
-        self.output_proj = nn.Linear(predictor_dim, input_dim)  # d → D
+        self.input_proj  = nn.Linear(input_dim, predictor_dim)
+        self.output_proj = nn.Linear(predictor_dim, input_dim)
 
         predictor_config = BertConfig(
-            vocab_size=1,
-            hidden_size=predictor_dim,
-            num_hidden_layers=num_layers,
-            num_attention_heads=num_heads,
-            intermediate_size=ffn_dim,
-            hidden_act="gelu",
-            hidden_dropout_prob=dropout,
+            vocab_size=1, hidden_size=predictor_dim, num_hidden_layers=num_layers,
+            num_attention_heads=num_heads, intermediate_size=ffn_dim,
+            hidden_act="gelu", hidden_dropout_prob=dropout,
             attention_probs_dropout_prob=dropout,
-            max_position_embeddings=max_length,
-            type_vocab_size=2,
-            initializer_range=0.02,
-            layer_norm_eps=1e-12,
-            pad_token_id=0,
+            max_position_embeddings=max_length, type_vocab_size=2,
+            initializer_range=0.02, layer_norm_eps=1e-12, pad_token_id=0,
             position_embedding_type="absolute",
         )
         self.bert = BertModel(predictor_config, add_pooling_layer=False)
 
-    def forward(
-        self,
-        hidden: torch.Tensor,          # [B, L, D]
-        attention_mask: torch.Tensor,
-        token_type_ids: torch.Tensor,
-    ) -> torch.Tensor:                 # [B, L, D]
-        x = self.input_proj(hidden)    # [B, L, d]
+    def forward(self, hidden, attention_mask, token_type_ids):
+        x = self.input_proj(hidden)
         x = self.bert(
             inputs_embeds=x,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             return_dict=True,
-        ).last_hidden_state            # [B, L, d]
-        return self.output_proj(x)     # [B, L, D]
+        ).last_hidden_state
+        return self.output_proj(x)
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4.  TextJEPA  (synced với tjepa_architecture.py)
+# ══════════════════════════════════════════════════════════════════════════════
 
 class TextJEPA(nn.Module):
+    """
+    Text JEPA: context encoder + EMA target encoder + predictor.
+
+    Parameters
+    ──────────
+    model_name       : "bert_base" (768-d, 12L) | "bert_large" (1024-d, 24L)
+    hidden_dim       : must match model_name (768 or 1024)
+    predictor_dim    : bottleneck dim d < D
+    predictor_layers : transformer depth (< encoder num_layers)
+    predictor_heads  : attention heads (predictor_dim % heads == 0)
+    predictor_ffn_dim: FFN hidden dim
+    max_length       : sequence length, must match dataloader
+    """
+
     def __init__(self, cfg: JEPAPretrainConfig):
         super().__init__()
-        encoder_config = build_bert_base_config(max_length=cfg.data.max_length)
-        if cfg.hidden_dim != encoder_config.hidden_size:
-            raise ValueError("hidden_dim must match the BERT encoder hidden size.")
-        if cfg.predictor_dim != encoder_config.hidden_size // 2:
-            raise ValueError("predictor_dim must be D/2, where D is the BERT encoder hidden size.")
-        if cfg.predictor_layers >= encoder_config.num_hidden_layers:
-            raise ValueError("predictor_layers must be fewer than the BERT encoder layers.")
 
+        if cfg.model_name not in _ENCODER_CONFIGS:
+            raise ValueError(f"model_name '{cfg.model_name}' not recognised. "
+                             f"Choose from: {list(_ENCODER_CONFIGS.keys())}")
+        encoder_config = _ENCODER_CONFIGS[cfg.model_name](max_length=cfg.data.max_length)
+
+        if cfg.hidden_dim != encoder_config.hidden_size:
+            raise ValueError(
+                f"hidden_dim ({cfg.hidden_dim}) must equal encoder hidden_size "
+                f"({encoder_config.hidden_size}) for model_name='{cfg.model_name}'.")
+
+        # Soft warning thay vì hard error (mirrors tjepa_architecture.py)
+        recommended = encoder_config.hidden_size // 2
+        if cfg.predictor_dim != recommended:
+            warnings.warn(
+                f"predictor_dim={cfg.predictor_dim} differs from recommended D/2={recommended}. "
+                "This is allowed but may affect training dynamics.", UserWarning, stacklevel=2)
+
+        if cfg.predictor_layers >= encoder_config.num_hidden_layers:
+            raise ValueError(
+                f"predictor_layers ({cfg.predictor_layers}) must be fewer than "
+                f"encoder layers ({encoder_config.num_hidden_layers}).")
+
+        self.hidden_dim      = encoder_config.hidden_size
         self.context_encoder = BertModel(encoder_config, add_pooling_layer=False)
-        self.target_encoder = copy.deepcopy(self.context_encoder)
+        self.target_encoder  = copy.deepcopy(self.context_encoder)
         self._freeze_target_encoder()
 
         self.predictor = SmallBertPredictor(
-            input_dim=cfg.hidden_dim,
+            input_dim=self.hidden_dim,
             predictor_dim=cfg.predictor_dim,
             num_heads=cfg.predictor_heads,
             num_layers=cfg.predictor_layers,
@@ -154,92 +211,152 @@ class TextJEPA(nn.Module):
             max_length=cfg.data.max_length,
         )
 
-    def _freeze_target_encoder(self) -> None:
-        for parameter in self.target_encoder.parameters():
-            parameter.requires_grad = False
+    # ── target encoder management ─────────────────────────────────────────────
 
-    @staticmethod
-    def span_jepa_loss(
-        pred: torch.Tensor,       # [B, L, D]
-        target: torch.Tensor,     # [B, L, D]
-        span_mask: torch.Tensor,  # [B, L]  binary, 1 at span token positions
-    ) -> torch.Tensor:
-        """Token-level L2 loss over span positions, averaged over spans.
-
-        Mirrors I-JEPA paper eq: (1/M) * sum_i sum_{j in B_i} ||pred_j - target_j||^2_2
-
-        Here M*|B_i| is approximated by the total number of span tokens (sum of span_mask),
-        so we compute mean L2 per span token — equivalent to the paper when spans are
-        equal size, and a sensible normalisation otherwise.
-
-        We do NOT pool tokens before computing loss (that would destroy per-token signal).
-        """
-        # squared L2 per token per dim: [B, L, D] -> [B, L]
-        l2_per_token = ((pred - target) ** 2).sum(dim=-1)
-        # zero out non-span positions
-        masked = l2_per_token * span_mask.float()
-        # mean over span tokens (total span tokens across batch)
-        n_span_tokens = span_mask.float().sum().clamp(min=1.0)
-        return masked.sum() / n_span_tokens
-
-    def encode(
-        self,
-        encoder: BertModel,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        token_type_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        output = encoder(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            return_dict=True,
-        )
-        return output.last_hidden_state  # [B, L, D]
+    def _freeze_target_encoder(self):
+        for p in self.target_encoder.parameters():
+            p.requires_grad = False
 
     @torch.no_grad()
     def update_target_encoder(self, decay: float) -> None:
-        for context, target in zip(self.context_encoder.parameters(), self.target_encoder.parameters()):
-            target.data.mul_(decay).add_(context.data, alpha=1.0 - decay)
+        """EMA update: target ← decay·target + (1−decay)·context."""
+        for ctx, tgt in zip(self.context_encoder.parameters(),
+                            self.target_encoder.parameters()):
+            tgt.data.mul_(decay).add_(ctx.data, alpha=1.0 - decay)
+
+    # ── encoder helpers ───────────────────────────────────────────────────────
+
+    def _encode(self, encoder, input_ids, attention_mask, token_type_ids):
+        """Run encoder, return last_hidden_state [B, L, D]."""
+        return encoder(
+            input_ids=input_ids, attention_mask=attention_mask,
+            token_type_ids=token_type_ids, return_dict=True,
+        ).last_hidden_state
+
+    def encode_full_sequence(self, batch: dict, use_target: bool = False) -> torch.Tensor:
+        """
+        Encode the CLEAN (unmasked) sentence through context or target encoder.
+        Returns all token embeddings [B, L, D] — mirrors I-JEPA's forward_all_patches().
+        Used by training script for fair effective-rank computation.
+
+        Parameters
+        ----------
+        batch      : 7-key batch dict from tjepa_dataloader
+        use_target : if True, use target encoder (no grad); else context encoder
+        """
+        encoder = self.target_encoder if use_target else self.context_encoder
+        return self._encode(
+            encoder,
+            batch["clean_input_ids"],
+            batch["clean_attention_mask"],
+            batch["clean_token_type_ids"],
+        )
+
+    # ── loss ──────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def span_jepa_loss(pred, target, span_mask):
+        """
+        Token-level L2 loss over span positions only, averaged over span tokens.
+        Mirrors I-JEPA eq: (1/M) Σ_i Σ_{j∈B_i} ‖pred_j − target_j‖²
+        """
+        l2_per_token = ((pred - target) ** 2).sum(dim=-1)
+        masked        = l2_per_token * span_mask.float()
+        n_span_tokens = span_mask.float().sum().clamp(min=1.0)
+        return masked.sum() / n_span_tokens
+
+    # ── forward ───────────────────────────────────────────────────────────────
 
     def forward(self, batch: dict) -> dict:
-        # Context encoder sees the span-masked sentence
-        masked_hidden = self.encode(
+        """
+        Accepts 7-key batch dict from tjepa_dataloader.JEPASpanMaskCollator.
+
+        Returns
+        ───────
+        dict:
+            predicted_hidden  [B, L, D]
+            target_hidden     [B, L, D]
+            span_loss         scalar
+        """
+        context_hidden = self._encode(
             self.context_encoder,
             batch["masked_input_ids"],
             batch["masked_attention_mask"],
             batch["masked_token_type_ids"],
-        )  # [B, L, D]
+        )
 
-        # Target encoder sees the clean sentence — no gradients, no projection
         with torch.no_grad():
-            clean_hidden = self.encode(
+            target_hidden = self._encode(
                 self.target_encoder,
                 batch["clean_input_ids"],
                 batch["clean_attention_mask"],
                 batch["clean_token_type_ids"],
-            )  # [B, L, D]
+            )
 
-        # Predictor: D → d (internal) → D
         predicted_hidden = self.predictor(
-            masked_hidden,
+            context_hidden,
             batch["masked_attention_mask"],
             batch["masked_token_type_ids"],
-        )  # [B, L, D]
-
-        # Loss: token-level L2 on span positions, target is raw encoder output (D)
-        span_loss = self.span_jepa_loss(
-            predicted_hidden,
-            clean_hidden.detach(),
-            batch["span_mask"],
         )
 
-        return {
-            "predicted_hidden": predicted_hidden,
-            "target_hidden": clean_hidden,
-            "span_loss": span_loss,
-        }
+        span_loss = self.span_jepa_loss(
+            predicted_hidden, target_hidden.detach(), batch["span_mask"])
 
+        return dict(
+            predicted_hidden = predicted_hidden,
+            target_hidden    = target_hidden,
+            span_loss        = span_loss,
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5.  HuggingFace Hub push
+# ══════════════════════════════════════════════════════════════════════════════
+
+def push_context_encoder_to_hub(
+    model: TextJEPA,
+    repo_id: str,
+    save_dir: str,
+    token: str | None = None,
+) -> None:
+    """
+    Lưu context_encoder ra disk rồi push lên HuggingFace Hub.
+
+    Parameters
+    ----------
+    model    : TextJEPA instance đã train
+    repo_id  : e.g. "ducanhdinh/jepa_proof_tjepa"
+    save_dir : thư mục tạm để lưu weights trước khi push
+    token    : HF token (lấy từ .env nếu None)
+    """
+    _token = token or HF_TOKEN
+    if not _token:
+        raise RuntimeError(
+            "HF_TOKEN không tìm thấy. "
+            "Thêm HF_TOKEN=<token> vào file .env hoặc truyền trực tiếp.")
+
+    encoder_dir = os.path.join(save_dir, "context_encoder")
+    os.makedirs(encoder_dir, exist_ok=True)
+
+    # Lưu weights + config của context_encoder
+    model.context_encoder.save_pretrained(encoder_dir)
+    print(f"Đã lưu context_encoder vào {encoder_dir}")
+
+    # Push lên Hub
+    api = HfApi()
+    api.create_repo(repo_id=repo_id, token=_token, exist_ok=True, repo_type="model")
+    api.upload_folder(
+        folder_path=encoder_dir,
+        repo_id=repo_id,
+        repo_type="model",
+        token=_token,
+    )
+    print(f"Đã push context_encoder lên https://huggingface.co/{repo_id}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6.  Pretrainer
+# ══════════════════════════════════════════════════════════════════════════════
 
 class JEPAPretrainer:
     def __init__(self, cfg: JEPAPretrainConfig):
@@ -367,6 +484,9 @@ class JEPAPretrainer:
                         f"step={step} validation={val} "
                         f"best_validation_loss={self.best_validation_loss:.4f} saved_best={saved}"
                     )
+                    if self.cfg.push_to_hub:
+                        push_context_encoder_to_hub(
+                            self.model, self.cfg.hf_repo_id, self.cfg.output_dir)
                     return
 
             val = self.evaluate()
@@ -378,6 +498,11 @@ class JEPAPretrainer:
                 f"epoch={epoch + 1} validation={val} "
                 f"best_validation_loss={self.best_validation_loss:.4f} saved_best={saved}"
             )
+
+        # Push sau khi train xong toàn bộ
+        if self.cfg.push_to_hub:
+            push_context_encoder_to_hub(
+                self.model, self.cfg.hf_repo_id, self.cfg.output_dir)
 
     def save_if_best(self, epoch: int, step: int, validation_loss: float) -> bool:
         if validation_loss >= self.best_validation_loss:
@@ -413,6 +538,10 @@ class JEPAPretrainer:
             },
         )
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7.  Entry point
+# ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
     trainer = JEPAPretrainer(JEPAPretrainConfig())

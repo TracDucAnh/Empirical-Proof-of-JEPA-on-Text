@@ -11,6 +11,14 @@ import os
 import sys
 from dataclasses import dataclass, field
 
+# ── Load .env (HF_TOKEN, v.v.) ────────────────────────────────────────────────
+from dotenv import load_dotenv
+
+load_dotenv()
+HF_TOKEN = os.environ.get("HF_TOKEN")
+HF_REPO_ID = "ducanhdinh/jepa_proof_vicreg"
+# ─────────────────────────────────────────────────────────────────────────────
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -234,6 +242,8 @@ class VICRegPretrainer:
                         f"step={step} validation={val} "
                         f"best_validation_loss={self.best_validation_loss:.4f} saved_best={saved}"
                     )
+                    # ── push to Hub sau khi đạt max_steps ────────────────────
+                    self.push_to_hub()
                     return
 
             val = self.evaluate()
@@ -245,6 +255,9 @@ class VICRegPretrainer:
                 f"epoch={epoch + 1} validation={val} "
                 f"best_validation_loss={self.best_validation_loss:.4f} saved_best={saved}"
             )
+
+        # ── push to Hub sau khi train xong toàn bộ epochs ────────────────────
+        self.push_to_hub()
 
     def save_if_best(self, epoch: int, step: int, validation_loss: float) -> bool:
         if validation_loss >= self.best_validation_loss:
@@ -279,6 +292,183 @@ class VICRegPretrainer:
                 "plotter_state": self.plotter.state_dict(),
             },
         )
+
+    # ── Hugging Face Hub ──────────────────────────────────────────────────────
+
+    def push_to_hub(self, repo_id: str = HF_REPO_ID) -> None:
+        """Push encoder + full model weights + model card lên Hugging Face Hub."""
+        if not HF_TOKEN:
+            print("⚠  HF_TOKEN không tìm thấy trong .env — bỏ qua push_to_hub.")
+            return
+
+        from huggingface_hub import HfApi, login
+        from transformers import BertTokenizerFast
+
+        print(f"\n🚀 Đang push model lên {repo_id} …")
+        login(token=HF_TOKEN)
+        api = HfApi(token=HF_TOKEN)
+
+        # Tạo repo nếu chưa tồn tại
+        api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
+
+        # Load best checkpoint trước khi push
+        best_path = self.checkpoint_path()
+        if os.path.exists(best_path):
+            checkpoint = torch.load(best_path, map_location="cpu", weights_only=False)
+            self.model.load_state_dict(checkpoint["model"])
+            print(f"   ✓ Loaded best checkpoint từ {best_path}")
+        else:
+            print("   ⚠  Không tìm thấy best checkpoint, push model weights hiện tại.")
+
+        # ── Push toàn bộ model (TextVICReg: encoder + expander) ──────────────
+        # Lưu state_dict ra file tạm rồi upload
+        weights_path = os.path.join(self.cfg.output_dir, "pytorch_model.bin")
+        torch.save(self.model.state_dict(), weights_path)
+        api.upload_file(
+            path_or_fileobj=weights_path,
+            path_in_repo="pytorch_model.bin",
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message="Add TextVICReg full model weights (encoder + expander)",
+        )
+        print("   ✓ Model weights đã được push.")
+
+        # ── Push chỉ encoder BERT (dễ dùng lại với transformers) ─────────────
+        encoder_dir = os.path.join(self.cfg.output_dir, "encoder_export")
+        os.makedirs(encoder_dir, exist_ok=True)
+        self.model.encoder.bert.save_pretrained(encoder_dir)
+        api.upload_folder(
+            folder_path=encoder_dir,
+            repo_id=repo_id,
+            repo_type="model",
+            path_in_repo="encoder",
+            commit_message="Add BERT encoder (mean-pool) weights",
+        )
+        print("   ✓ BERT encoder đã được push vào thư mục encoder/.")
+
+        # ── Push tokenizer ────────────────────────────────────────────────────
+        tokenizer = BertTokenizerFast.from_pretrained(
+            "bert-base-uncased",
+            model_max_length=self.cfg.data.max_length,
+        )
+        tokenizer_dir = os.path.join(self.cfg.output_dir, "tokenizer_export")
+        os.makedirs(tokenizer_dir, exist_ok=True)
+        tokenizer.save_pretrained(tokenizer_dir)
+        api.upload_folder(
+            folder_path=tokenizer_dir,
+            repo_id=repo_id,
+            repo_type="model",
+            path_in_repo=".",
+            commit_message="Add tokenizer",
+        )
+        print("   ✓ Tokenizer đã được push.")
+
+        # ── Push model card ───────────────────────────────────────────────────
+        self._push_model_card(repo_id, api)
+
+        print(f"   ✅ Xong! Model đã có tại https://huggingface.co/{repo_id}\n")
+
+    def _push_model_card(self, repo_id: str, api) -> None:
+        """Tự sinh và push README.md (model card) lên Hub."""
+        card_content = f"""\
+---
+language: en
+license: apache-2.0
+tags:
+  - bert
+  - vicreg
+  - self-supervised-learning
+  - contrastive-learning
+  - pretraining
+  - text-embeddings
+---
+
+# {repo_id}
+
+BERT encoder pretrained from scratch với **VICReg** (Variance-Invariance-Covariance Regularization).
+
+Hai masked text views được encode bởi một BERT encoder dùng chung, sau đó đưa qua expander MLP.
+VICReg kết hợp 3 loss terms để căn chỉnh các views và ngăn feature collapse mà không cần negative samples:
+
+| Loss term | Hệ số | Mô tả |
+|---|---|---|
+| Invariance | `{self.cfg.sim_coeff}` | MSE giữa z1 và z2 (căn chỉnh hai views) |
+| Variance | `{self.cfg.std_coeff}` | Giữ std của mỗi chiều ≥ 1 (chống collapse) |
+| Covariance | `{self.cfg.cov_coeff}` | Decorrelate các chiều embedding |
+
+## Kiến trúc
+
+```
+Text → BERT (mean-pool) → z ∈ R^768 → Expander MLP → z' ∈ R^{self.cfg.expander_dim}
+                                                       ↑ VICReg loss áp dụng tại đây
+```
+
+Expander gồm 3 lớp Linear-BatchNorm-ReLU (dim = `{self.cfg.expander_dim}`).
+
+## Thông số huấn luyện
+
+| Tham số | Giá trị |
+|---|---|
+| Max sequence length | {self.cfg.data.max_length} |
+| Batch size | {self.cfg.optim.batch_size} |
+| Epochs | {self.cfg.optim.epochs} |
+| Learning rate | {self.cfg.optim.lr} |
+| Expander dim | {self.cfg.expander_dim} |
+| Max span length (masking) | {self.cfg.max_span_length} |
+| sim_coeff | {self.cfg.sim_coeff} |
+| std_coeff | {self.cfg.std_coeff} |
+| cov_coeff | {self.cfg.cov_coeff} |
+
+## Cách dùng — BERT encoder (feature extraction)
+
+```python
+from transformers import BertModel, BertTokenizerFast
+import torch
+
+tokenizer = BertTokenizerFast.from_pretrained("{repo_id}")
+bert      = BertModel.from_pretrained("{repo_id}/encoder")
+
+encoded = tokenizer(
+    ["Hello world!", "VICReg is great."],
+    return_tensors="pt",
+    padding=True,
+    truncation=True,
+)
+with torch.no_grad():
+    out    = bert(**encoded)
+    hidden = out.last_hidden_state          # (B, T, 768)
+    mask   = encoded["attention_mask"].unsqueeze(-1).float()
+    emb    = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1)  # mean-pool → (B, 768)
+```
+
+## Cách dùng — Full model (encoder + expander)
+
+```python
+import torch
+from transformers import BertTokenizerFast
+
+# Load weights thủ công
+from text_vicreg import TextVICReg, VICRegPretrainConfig
+
+cfg   = VICRegPretrainConfig()
+model = TextVICReg(cfg)
+state = torch.load(
+    hf_hub_download("{repo_id}", "pytorch_model.bin"),
+    map_location="cpu",
+)
+model.load_state_dict(state)
+model.eval()
+```
+"""
+
+        api.upload_file(
+            path_or_fileobj=card_content.encode(),
+            path_in_repo="README.md",
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message="Add model card",
+        )
+        print("   ✓ Model card đã được push.")
 
 
 def main() -> None:

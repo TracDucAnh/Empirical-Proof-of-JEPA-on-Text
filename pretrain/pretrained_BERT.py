@@ -11,6 +11,14 @@ import os
 import sys
 from dataclasses import dataclass, field
 
+# ── Load .env (HF_TOKEN, v.v.) ────────────────────────────────────────────────
+from dotenv import load_dotenv
+
+load_dotenv()
+HF_TOKEN = os.environ.get("HF_TOKEN")
+HF_REPO_ID = "ducanhdinh/jepa_proof_bert"
+# ─────────────────────────────────────────────────────────────────────────────
+
 import matplotlib
 
 matplotlib.use("Agg")
@@ -215,6 +223,8 @@ class BERTPretrainer:
                         f"step={step} validation_pretraining_loss={val_loss:.4f} "
                         f"best_validation_loss={self.best_validation_loss:.4f} saved_best={saved}"
                     )
+                    # ── push to Hub sau khi đạt max_steps ────────────────────
+                    self.push_to_hub()
                     return
 
             val_loss = self.evaluate()
@@ -226,6 +236,9 @@ class BERTPretrainer:
                 f"epoch={epoch + 1} validation_pretraining_loss={val_loss:.4f} "
                 f"best_validation_loss={self.best_validation_loss:.4f} saved_best={saved}"
             )
+
+        # ── push to Hub sau khi train xong toàn bộ epochs ────────────────────
+        self.push_to_hub()
 
     def save_if_best(self, epoch: int, step: int, validation_loss: float) -> bool:
         if validation_loss >= self.best_validation_loss:
@@ -260,6 +273,108 @@ class BERTPretrainer:
                 "plotter_state": self.plotter.state_dict(),
             },
         )
+
+    # ── Hugging Face Hub ──────────────────────────────────────────────────────
+
+    def push_to_hub(self, repo_id: str = HF_REPO_ID) -> None:
+        """Push model + tokenizer + model card lên Hugging Face Hub."""
+        if not HF_TOKEN:
+            print("⚠  HF_TOKEN không tìm thấy trong .env — bỏ qua push_to_hub.")
+            return
+
+        from huggingface_hub import login
+        from transformers import BertTokenizerFast
+
+        print(f"\n🚀 Đang push model lên {repo_id} …")
+        login(token=HF_TOKEN)
+
+        # Load best checkpoint trước khi push
+        best_path = self.checkpoint_path()
+        if os.path.exists(best_path):
+            checkpoint = torch.load(best_path, map_location="cpu", weights_only=False)
+            self.model.load_state_dict(checkpoint["model"])
+            print(f"   ✓ Loaded best checkpoint từ {best_path}")
+        else:
+            print("   ⚠  Không tìm thấy best checkpoint, push model weights hiện tại.")
+
+        # Push model weights + config
+        self.model.push_to_hub(
+            repo_id,
+            token=HF_TOKEN,
+            commit_message="Add pretrained BERT (MLM+NSP) checkpoint",
+        )
+
+        # Push tokenizer (bert-base-uncased làm base, giữ max_length của config)
+        tokenizer = BertTokenizerFast.from_pretrained(
+            "bert-base-uncased",
+            model_max_length=self.cfg.data.max_length,
+        )
+        tokenizer.push_to_hub(
+            repo_id,
+            token=HF_TOKEN,
+            commit_message="Add tokenizer",
+        )
+
+        # Push model card (README.md)
+        self._push_model_card(repo_id)
+
+        print(f"   ✅ Xong! Model đã có tại https://huggingface.co/{repo_id}\n")
+
+    def _push_model_card(self, repo_id: str) -> None:
+        """Tự sinh và push README.md (model card) lên Hub."""
+        from huggingface_hub import HfApi
+
+        card_content = f"""\
+---
+language: en
+license: apache-2.0
+tags:
+  - bert
+  - masked-language-modeling
+  - next-sentence-prediction
+  - pretraining
+---
+
+# {repo_id}
+
+BERT base pretrained from scratch với hai mục tiêu:
+- **Masked Language Modeling (MLM)** — 80/10/10 replacement rule, mask probability `{self.cfg.mlm_probability}`
+- **Next Sentence Prediction (NSP)**
+
+## Thông số huấn luyện
+
+| Tham số | Giá trị |
+|---|---|
+| Max sequence length | {self.cfg.data.max_length} |
+| Batch size | {self.cfg.optim.batch_size} |
+| Epochs | {self.cfg.optim.epochs} |
+| Learning rate | {self.cfg.optim.lr} |
+| MLM probability | {self.cfg.mlm_probability} |
+
+## Cách dùng
+
+```python
+from transformers import BertForPreTraining, BertTokenizerFast
+import torch
+
+tokenizer = BertTokenizerFast.from_pretrained("{repo_id}")
+model     = BertForPreTraining.from_pretrained("{repo_id}")
+
+encoded = tokenizer("Hello world!", return_tensors="pt")
+with torch.no_grad():
+    output = model(**encoded)
+```
+"""
+
+        api = HfApi(token=HF_TOKEN)
+        api.upload_file(
+            path_or_fileobj=card_content.encode(),
+            path_in_repo="README.md",
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message="Add model card",
+        )
+        print("   ✓ Model card đã được push.")
 
 
 def main() -> None:

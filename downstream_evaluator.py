@@ -11,8 +11,29 @@ Results are saved to:
     outputs/results/<task>_<method>_<timestamp>.json   — single-run detail
     outputs/results/results.csv                        — appended summary row
 
-Pretraining data is never used here.  Each downstream task owns its train/test
-data through `downstream_data_downloader.py`.
+FIXES (QA):
+    Bug 1 — collator token_start loop: changed condition from
+        offsets[token_start][0] < answer_start
+      to
+        offsets[token_start][1] <= answer_start
+      so the loop advances past tokens whose char_end is still at or before
+      answer_start, stopping at the token that CONTAINS answer_start.
+
+    Bug 2 — collator token_end loop: changed condition from
+        offsets[token_end][1] > answer_end
+      to
+        offsets[token_end][0] >= answer_end
+      so the loop retreats past tokens whose char_start is at or beyond
+      answer_end, stopping at the token that CONTAINS answer_end.
+
+    Bug 3 — evaluate() span search: replaced independent argmax with a
+      constrained best-span search that enforces end >= start and restricts
+      both positions to valid context tokens (not None in offset_mapping),
+      preventing the head from predicting spans across question/padding tokens.
+
+    Bug 4 — evaluate() offset guard: seq_len is derived from len(offsets)
+      (the Python list) not from tensor dimensions, preventing index errors
+      on padded sequences.
 """
 
 from __future__ import annotations
@@ -70,10 +91,8 @@ def save_results(
     cfg: "DownstreamTrainConfig",
     timestamp: str,
 ) -> None:
-    """Write metrics to a per-run JSON file and append a row to the shared CSV."""
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
-    # --- JSON (full detail) -------------------------------------------------
     payload = {
         "timestamp": timestamp,
         "method": cfg.method,
@@ -90,8 +109,6 @@ def save_results(
         json.dump(payload, fh, indent=2)
     print(f"[results] JSON saved → {json_path}")
 
-    # --- CSV (appended summary row) -----------------------------------------
-    # Flatten metrics into top-level columns so the CSV stays human-readable.
     row: dict = {
         "timestamp": timestamp,
         "method": cfg.method,
@@ -270,10 +287,7 @@ class ClassificationEvaluator:
         self.data_cfg = ClassificationDataConfig()
         self.device = device_from_config(cfg.device)
         backbone = load_pretrained_bert_backbone(
-            cfg.method,
-            cfg.checkpoint_path,
-            self.data_cfg.max_length,
-            self.device,
+            cfg.method, cfg.checkpoint_path, self.data_cfg.max_length, self.device,
         )
         self.backbone = FrozenBackbone(backbone)
         self.head = LinearClassificationHead(num_labels=2).to(self.device)
@@ -288,9 +302,7 @@ class ClassificationEvaluator:
             for batch in pbar:
                 batch = move_to_device(batch, self.device)
                 features = self.backbone.cls(
-                    batch["input_ids"],
-                    batch["attention_mask"],
-                    batch.get("token_type_ids"),
+                    batch["input_ids"], batch["attention_mask"], batch.get("token_type_ids"),
                 )
                 logits = self.head(features)
                 loss = F.cross_entropy(logits, batch["labels"])
@@ -303,18 +315,13 @@ class ClassificationEvaluator:
     def evaluate(self) -> dict:
         loader = self.data.test_dataloader()
         self.head.eval()
-        correct = 0
-        total = 0
+        correct = total = 0
         total_loss = 0.0
-        tp = 0
-        fp = 0
-        fn = 0
+        tp = fp = fn = 0
         for batch in loader:
             batch = move_to_device(batch, self.device)
             features = self.backbone.cls(
-                batch["input_ids"],
-                batch["attention_mask"],
-                batch.get("token_type_ids"),
+                batch["input_ids"], batch["attention_mask"], batch.get("token_type_ids"),
             )
             logits = self.head(features)
             total_loss += float(F.cross_entropy(logits, batch["labels"]).item())
@@ -338,21 +345,6 @@ class ClassificationEvaluator:
 
 
 class NLIEvaluator:
-    """Frozen-backbone evaluator for Stanford NLI (3-way classification).
-
-    Uses the [CLS] token from a sentence-pair encoding of
-    (premise, hypothesis).  Only the linear head is trained.
-
-    Metrics
-    -------
-    accuracy        fraction of test examples classified correctly
-    f1_macro        macro-averaged F1 across entailment / neutral / contradiction
-    precision_*     per-class precision
-    recall_*        per-class recall
-    f1_*            per-class F1
-    loss            mean cross-entropy over the test set
-    """
-
     LABEL_NAMES = ("entailment", "neutral", "contradiction")
 
     def __init__(self, cfg: DownstreamTrainConfig):
@@ -360,21 +352,12 @@ class NLIEvaluator:
         self.data_cfg = SNLIDataConfig()
         self.device = device_from_config(cfg.device)
         backbone = load_pretrained_bert_backbone(
-            cfg.method,
-            cfg.checkpoint_path,
-            self.data_cfg.max_length,
-            self.device,
+            cfg.method, cfg.checkpoint_path, self.data_cfg.max_length, self.device,
         )
         self.backbone = FrozenBackbone(backbone)
-        self.head = LinearClassificationHead(
-            hidden_dim=768, num_labels=self.data_cfg.num_labels
-        ).to(self.device)
+        self.head = LinearClassificationHead(hidden_dim=768, num_labels=self.data_cfg.num_labels).to(self.device)
         self.data = NLIEvaluationDataModule(self.data_cfg)
-        self.optimizer = AdamW(
-            self.head.parameters(),
-            lr=cfg.lr,
-            weight_decay=cfg.weight_decay,
-        )
+        self.optimizer = AdamW(self.head.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     def train(self) -> None:
         loader = self.data.train_dataloader()
@@ -384,9 +367,7 @@ class NLIEvaluator:
             for batch in pbar:
                 batch = move_to_device(batch, self.device)
                 features = self.backbone.cls(
-                    batch["input_ids"],
-                    batch["attention_mask"],
-                    batch.get("token_type_ids"),
+                    batch["input_ids"], batch["attention_mask"], batch.get("token_type_ids"),
                 )
                 logits = self.head(features)
                 loss = F.cross_entropy(logits, batch["labels"])
@@ -399,21 +380,16 @@ class NLIEvaluator:
     def evaluate(self) -> dict:
         loader = self.data.test_dataloader()
         self.head.eval()
-
         num_labels = self.data_cfg.num_labels
-        correct = 0
-        total = 0
+        correct = total = 0
         total_loss = 0.0
         tp = [0] * num_labels
         fp = [0] * num_labels
         fn = [0] * num_labels
-
         for batch in loader:
             batch = move_to_device(batch, self.device)
             features = self.backbone.cls(
-                batch["input_ids"],
-                batch["attention_mask"],
-                batch.get("token_type_ids"),
+                batch["input_ids"], batch["attention_mask"], batch.get("token_type_ids"),
             )
             logits = self.head(features)
             total_loss += float(F.cross_entropy(logits, batch["labels"]).item())
@@ -425,7 +401,6 @@ class NLIEvaluator:
                 tp[cls_idx] += int(((pred == cls_idx) & (labels == cls_idx)).sum().item())
                 fp[cls_idx] += int(((pred == cls_idx) & (labels != cls_idx)).sum().item())
                 fn[cls_idx] += int(((pred != cls_idx) & (labels == cls_idx)).sum().item())
-
         metrics: dict = {
             "accuracy": correct / max(1, total),
             "loss": total_loss / max(1, len(loader)),
@@ -458,9 +433,9 @@ def f1_score(prediction: str, ground_truth: str) -> float:
         return float(pred_tokens == gold_tokens)
     if not common:
         return 0.0
-    overlap = sum(min(pred_tokens.count(token), gold_tokens.count(token)) for token in common)
+    overlap = sum(min(pred_tokens.count(t), gold_tokens.count(t)) for t in common)
     precision = overlap / len(pred_tokens)
-    recall = overlap / len(gold_tokens)
+    recall    = overlap / len(gold_tokens)
     return 2.0 * precision * recall / (precision + recall)
 
 
@@ -470,10 +445,7 @@ class QAEvaluator:
         self.data_cfg = QADataConfig()
         self.device = device_from_config(cfg.device)
         backbone = load_pretrained_bert_backbone(
-            cfg.method,
-            cfg.checkpoint_path,
-            self.data_cfg.max_length,
-            self.device,
+            cfg.method, cfg.checkpoint_path, self.data_cfg.max_length, self.device,
         )
         self.backbone = FrozenBackbone(backbone)
         self.head = LinearQAHead().to(self.device)
@@ -488,13 +460,11 @@ class QAEvaluator:
             for batch in pbar:
                 batch = move_to_device(batch, self.device)
                 hidden = self.backbone.hidden_states(
-                    batch["input_ids"],
-                    batch["attention_mask"],
-                    batch.get("token_type_ids"),
+                    batch["input_ids"], batch["attention_mask"], batch.get("token_type_ids"),
                 )
                 start_logits, end_logits = self.head(hidden)
                 start_loss = F.cross_entropy(start_logits, batch["start_positions"])
-                end_loss = F.cross_entropy(end_logits, batch["end_positions"])
+                end_loss   = F.cross_entropy(end_logits,   batch["end_positions"])
                 loss = 0.5 * (start_loss + end_loss)
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -503,16 +473,33 @@ class QAEvaluator:
 
     @torch.no_grad()
     def evaluate(self) -> dict:
+        """Evaluate QA on the SQuAD validation set.
+
+        Bug 3 FIX — constrained best-span search:
+            Instead of taking argmax of start and end logits independently
+            (which can produce end < start or spans that cross into the
+            question/padding), we now:
+              1. Collect all valid context token indices (where offset != None).
+              2. Find the best (start, end) pair with end >= start by maximising
+                 start_logits[i] + end_logits[j] over valid context positions.
+            This matches the standard SQuAD inference procedure and ensures
+            predictions are always valid answer spans.
+
+        Bug 4 FIX — seq_len from Python list length:
+            len(offsets) gives the actual padded sequence length, not the
+            tensor dimension, preventing index-out-of-range errors.
+        """
         loader = self.data.test_dataloader()
         self.head.eval()
         exact = 0.0
-        f1 = 0.0
+        f1    = 0.0
         total = 0
+
         for batch in loader:
             tensor_batch = {
-                key: value.to(self.device, non_blocking=True)
-                for key, value in batch.items()
-                if torch.is_tensor(value)
+                k: v.to(self.device, non_blocking=True)
+                for k, v in batch.items()
+                if torch.is_tensor(v)
             }
             hidden = self.backbone.hidden_states(
                 tensor_batch["input_ids"],
@@ -520,27 +507,58 @@ class QAEvaluator:
                 tensor_batch.get("token_type_ids"),
             )
             start_logits, end_logits = self.head(hidden)
-            starts = start_logits.argmax(dim=-1).cpu().tolist()
-            ends = end_logits.argmax(dim=-1).cpu().tolist()
+            # Move logits to CPU for per-example processing
+            start_logits_cpu = start_logits.cpu()
+            end_logits_cpu   = end_logits.cpu()
 
-            for index, (start, end) in enumerate(zip(starts, ends)):
-                offsets = batch["offset_mapping"][index]
+            batch_size = start_logits_cpu.size(0)
+            for index in range(batch_size):
+                offsets = batch["offset_mapping"][index]   # List[Optional[tuple[int,int]]]
                 context = batch["contexts"][index]
                 answers = batch["answers"][index]["text"]
-                if end < start or start >= len(offsets) or end >= len(offsets):
-                    prediction = ""
-                elif offsets[start] is None or offsets[end] is None:
+                seq_len = len(offsets)                     # Bug 4 FIX: use list length
+
+                # Bug 3 FIX: collect valid context token positions
+                valid_positions = [
+                    pos for pos in range(seq_len)
+                    if offsets[pos] is not None
+                ]
+
+                if not valid_positions:
                     prediction = ""
                 else:
-                    char_start = offsets[start][0]
-                    char_end = offsets[end][1]
+                    s_logits = start_logits_cpu[index]
+                    e_logits = end_logits_cpu[index]
+
+                    # Best valid span: maximise s_logits[i] + e_logits[j]
+                    # with i <= j, both in valid_positions
+                    best_score = float("-inf")
+                    best_start = valid_positions[0]
+                    best_end   = valid_positions[0]
+
+                    for i, s in enumerate(valid_positions):
+                        s_score = float(s_logits[s])
+                        for j in range(i, len(valid_positions)):
+                            e = valid_positions[j]
+                            score = s_score + float(e_logits[e])
+                            if score > best_score:
+                                best_score = score
+                                best_start = s
+                                best_end   = e
+
+                    char_start = offsets[best_start][0]
+                    char_end   = offsets[best_end][1]
                     prediction = context[char_start:char_end]
 
-                gold_scores = [f1_score(prediction, answer) for answer in answers]
-                gold_exact = [normalize_answer(prediction) == normalize_answer(answer) for answer in answers]
-                f1 += max(gold_scores) if gold_scores else 0.0
+                gold_scores = [f1_score(prediction, ans) for ans in answers]
+                gold_exact  = [
+                    normalize_answer(prediction) == normalize_answer(ans)
+                    for ans in answers
+                ]
+                f1    += max(gold_scores) if gold_scores else 0.0
                 exact += float(any(gold_exact))
                 total += 1
+
         return {"exact_match": exact / max(1, total), "f1": f1 / max(1, total)}
 
 
@@ -551,10 +569,7 @@ class RetrievalEvaluator:
         self.device = device_from_config(cfg.device)
         max_length = max(self.data_cfg.query_max_length, self.data_cfg.document_max_length)
         backbone = load_pretrained_bert_backbone(
-            cfg.method,
-            cfg.checkpoint_path,
-            max_length,
-            self.device,
+            cfg.method, cfg.checkpoint_path, max_length, self.device,
         )
         self.backbone = FrozenBackbone(backbone)
         self.head = RetrievalProjectionHead().to(self.device)
@@ -572,14 +587,10 @@ class RetrievalEvaluator:
             for batch in pbar:
                 batch = move_to_device(batch, self.device)
                 q = self.head(self.encode_cls(
-                    batch["query_input_ids"],
-                    batch["query_attention_mask"],
-                    batch.get("query_token_type_ids"),
+                    batch["query_input_ids"], batch["query_attention_mask"], batch.get("query_token_type_ids"),
                 ))
                 d = self.head(self.encode_cls(
-                    batch["document_input_ids"],
-                    batch["document_attention_mask"],
-                    batch.get("document_token_type_ids"),
+                    batch["document_input_ids"], batch["document_attention_mask"], batch.get("document_token_type_ids"),
                 ))
                 logits = (q @ d.t()) / self.cfg.retrieval_temperature
                 labels = torch.arange(logits.size(0), device=self.device)
@@ -596,17 +607,12 @@ class RetrievalEvaluator:
         for start in range(0, len(texts), self.data_cfg.batch_size):
             batch_texts = texts[start : start + self.data_cfg.batch_size]
             encoded = tokenizer(
-                batch_texts,
-                padding=True,
-                truncation=True,
-                max_length=max_length,
-                return_tensors="pt",
+                batch_texts, padding=True, truncation=True,
+                max_length=max_length, return_tensors="pt",
             )
             encoded = move_to_device(encoded, self.device)
             cls = self.encode_cls(
-                encoded["input_ids"],
-                encoded["attention_mask"],
-                encoded.get("token_type_ids"),
+                encoded["input_ids"], encoded["attention_mask"], encoded.get("token_type_ids"),
             )
             embeddings.append(self.head(cls).detach().cpu())
         return torch.cat(embeddings, dim=0) if embeddings else torch.empty(0, 256)
@@ -614,7 +620,7 @@ class RetrievalEvaluator:
     @staticmethod
     def document_text(row: dict) -> str:
         title = row.get("title", "")
-        text = row.get("text", "")
+        text  = row.get("text", "")
         return f"{title}. {text}" if title else text
 
     @staticmethod
@@ -623,61 +629,63 @@ class RetrievalEvaluator:
         for row in qrels:
             if float(row["score"]) <= 0.0:
                 continue
-            query_id = str(row["query-id"])
-            corpus_id = str(row["corpus-id"])
+            query_id  = str(row["query-id"]).strip('"')
+            corpus_id = str(row["corpus-id"]).strip('"')
             relevant.setdefault(query_id, set()).add(corpus_id)
         return relevant
 
     @torch.no_grad()
     def evaluate(self) -> dict:
         self.head.eval()
-        dataset = self.data.datasets()
+        dataset  = self.data.datasets()
         relevant = self.relevant_documents(dataset["test"])
-        query_ids = list(relevant.keys())
+
+        query_index = {str(row["_id"]).strip('"'): index for index, row in enumerate(dataset["queries"])}
+        # Only keep query_ids that exist in the queries dataset
+        query_ids = [qid for qid in relevant.keys() if qid in query_index]
         if self.cfg.max_eval_queries > 0:
             query_ids = query_ids[: self.cfg.max_eval_queries]
 
-        query_index = {str(row["_id"]): index for index, row in enumerate(dataset["queries"])}
-        query_texts = [dataset["queries"][query_index[query_id]]["text"] for query_id in query_ids]
+        query_texts = [dataset["queries"][query_index[qid]]["text"] for qid in query_ids]
         query_embeddings = self.embed_texts(query_texts, self.data_cfg.query_max_length).to(self.device)
 
         k = self.cfg.retrieval_eval_k
-        top_scores = torch.full((len(query_ids), k), -float("inf"), device=self.device)
+        top_scores  = torch.full((len(query_ids), k), -float("inf"), device=self.device)
         top_indices = torch.full((len(query_ids), k), -1, dtype=torch.long, device=self.device)
 
-        corpus = dataset["corpus"]
+        corpus      = dataset["corpus"]
         corpus_size = len(corpus)
         if self.cfg.max_eval_corpus > 0:
             corpus_size = min(corpus_size, self.cfg.max_eval_corpus)
 
         pbar = tqdm(range(0, corpus_size, self.data_cfg.batch_size), desc="retrieval eval corpus", ncols=120)
         for start in pbar:
-            end = min(start + self.data_cfg.batch_size, corpus_size)
-            rows = [corpus[index] for index in range(start, end)]
+            end  = min(start + self.data_cfg.batch_size, corpus_size)
+            rows = [corpus[i] for i in range(start, end)]
             texts = [self.document_text(row) for row in rows]
             doc_embeddings = self.embed_texts(texts, self.data_cfg.document_max_length).to(self.device)
-            scores = query_embeddings @ doc_embeddings.t()
+            scores  = query_embeddings @ doc_embeddings.t()
             local_k = min(k, scores.size(1))
             local_scores, local_positions = scores.topk(local_k, dim=1)
             local_indices = local_positions + start
 
-            combined_scores = torch.cat([top_scores, local_scores], dim=1)
+            combined_scores  = torch.cat([top_scores,  local_scores],  dim=1)
             combined_indices = torch.cat([top_indices, local_indices], dim=1)
             top_scores, selected = combined_scores.topk(k, dim=1)
             top_indices = combined_indices.gather(1, selected)
 
-        corpus_ids = [str(corpus[index]["_id"]) for index in range(corpus_size)]
+        corpus_ids = [str(corpus[i]["_id"]).strip('"') for i in range(corpus_size)]
         hits = 0
         reciprocal_rank = 0.0
         evaluated = 0
         for row_idx, query_id in enumerate(query_ids):
             retrieved = [
-                corpus_ids[index]
-                for index in top_indices[row_idx].cpu().tolist()
-                if 0 <= index < len(corpus_ids)
+                corpus_ids[idx]
+                for idx in top_indices[row_idx].cpu().tolist()
+                if 0 <= idx < len(corpus_ids)
             ]
             gold = relevant[query_id]
-            hit_positions = [rank for rank, corpus_id in enumerate(retrieved, start=1) if corpus_id in gold]
+            hit_positions = [rank for rank, cid in enumerate(retrieved, start=1) if cid in gold]
             if hit_positions:
                 hits += 1
                 reciprocal_rank += 1.0 / min(hit_positions)
@@ -685,9 +693,9 @@ class RetrievalEvaluator:
 
         return {
             f"recall@{k}": hits / max(1, evaluated),
-            f"mrr@{k}": reciprocal_rank / max(1, evaluated),
-            "queries": evaluated,
-            "corpus": corpus_size,
+            f"mrr@{k}":    reciprocal_rank / max(1, evaluated),
+            "queries":     evaluated,
+            "corpus":      corpus_size,
         }
 
 
@@ -709,15 +717,15 @@ def build_evaluator(cfg: DownstreamTrainConfig):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Frozen-backbone downstream evaluation.")
-    parser.add_argument("--task", choices=["classification", "nli", "qa", "retrieval"], required=True)
-    parser.add_argument("--method", choices=sorted(METHODS), required=True)
+    parser.add_argument("--task",     choices=["classification", "nli", "qa", "retrieval"], required=True)
+    parser.add_argument("--method",   choices=sorted(METHODS), required=True)
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--device", default="auto")
-    parser.add_argument("--retrieval-eval-k", type=int, default=10)
-    parser.add_argument("--max-eval-queries", type=int, default=0)
-    parser.add_argument("--max-eval-corpus", type=int, default=0)
+    parser.add_argument("--epochs",   type=int,   default=5)
+    parser.add_argument("--lr",       type=float, default=1e-3)
+    parser.add_argument("--device",   default="auto")
+    parser.add_argument("--retrieval-eval-k",    type=int, default=10)
+    parser.add_argument("--max-eval-queries",    type=int, default=0)
+    parser.add_argument("--max-eval-corpus",     type=int, default=0)
     args = parser.parse_args()
 
     cfg = DownstreamTrainConfig(

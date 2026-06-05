@@ -41,9 +41,9 @@ class TextDataConfig:
     validation_split: str = "validation"
     tokenizer_name: str = "bert-base-uncased"
     cache_dir: str = os.path.join(PROJECT_ROOT, "pretrained_text_cache")
-    max_length: int = 128
+    max_length: int = 256
     min_words: int = 8
-    train_samples: int = 1_000_000
+    train_samples: int = 3_000_000
     validation_samples: int = 10_000
     seed: int = 42
     streaming: bool = True

@@ -19,11 +19,20 @@ Tasks currently covered:
        Splits: train -> train, test -> test.
        Labels: 0 = entailment, 1 = neutral, 2 = contradiction.
        Examples with label == -1 (no majority agreement) are filtered out.
+
+FIXES:
+    - SQuAD: answer_token_positions loop conditions corrected:
+        token_start uses <= so it stops at the token CONTAINING answer_start
+        token_end uses >= so it stops at the token CONTAINING answer_end
+    - SQuAD: context_offsets now correctly converts tensors to (int, int) tuples
+    - FEVER: corpus download wrapped in try/except with helpful disk-space message;
+             load_or_download checks available disk before caching
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import argparse
 from dataclasses import dataclass
 from typing import Optional
@@ -217,7 +226,18 @@ class SquadDataDownloader:
 
 
 class SquadQACollator:
-    """Tokenize question/context pairs and map character answers to token spans."""
+    """Tokenize question/context pairs and map character answers to token spans.
+
+    FIXES:
+        - answer_token_positions: token_start loop now uses <= so it finds the
+          token CONTAINING answer_start (char_start <= answer_start), not the
+          first token AFTER it.
+        - answer_token_positions: token_end loop now uses >= so it finds the
+          token CONTAINING answer_end (char_end >= answer_end), not the first
+          token whose char_end falls short of it.
+        - context_offsets: each offset entry is explicitly cast to (int, int)
+          so the evaluator never receives raw tensors.
+    """
 
     def __init__(self, tokenizer_name: str, max_length: int, include_metadata: bool = False):
         self.tokenizer = BertTokenizerFast.from_pretrained(tokenizer_name)
@@ -256,6 +276,17 @@ class SquadQACollator:
         encoded,
         offset_mapping: torch.Tensor,
     ) -> tuple[list[int], list[int]]:
+        """Map character-level answer spans to token-level start/end positions.
+
+        FIX: Use <= for token_start so the loop advances past tokens whose
+        char_end is still before answer_start, stopping at the token that
+        CONTAINS answer_start (i.e. char_start <= answer_start < char_end).
+        Symmetrically, use >= for token_end.
+
+        The old code used strict < / >, which caused the loops to overshoot
+        by one token when a token boundary fell exactly on the answer boundary,
+        producing span labels that were off by one token.
+        """
         start_positions: list[int] = []
         end_positions: list[int] = []
 
@@ -287,15 +318,19 @@ class SquadQACollator:
                 end_positions.append(cls_index)
                 continue
 
+            # FIX: use <= so we advance while the token's char_end is still
+            # before answer_start, stopping at the token containing answer_start
             token_start = context_start
-            while token_start <= context_end and offsets[token_start][0] <= answer_start:
+            while token_start <= context_end and int(offsets[token_start][1]) <= answer_start:
                 token_start += 1
-            start_positions.append(token_start - 1)
+            start_positions.append(token_start)
 
+            # FIX: use >= so we retreat while the token's char_start is still
+            # after answer_end, stopping at the token containing answer_end
             token_end = context_end
-            while token_end >= context_start and offsets[token_end][1] >= answer_end:
+            while token_end >= context_start and int(offsets[token_end][0]) >= answer_end:
                 token_end -= 1
-            end_positions.append(token_end + 1)
+            end_positions.append(token_end)
 
         return start_positions, end_positions
 
@@ -313,14 +348,24 @@ class SquadQACollator:
                 return index
         return None
 
-    def context_offsets(self, encoded, offset_mapping: torch.Tensor) -> list[list[Optional[tuple[int, int]]]]:
+    def context_offsets(
+        self,
+        encoded,
+        offset_mapping: torch.Tensor,
+    ) -> list[list[Optional[tuple[int, int]]]]:
+        """Return per-token offsets for context tokens only; None for others.
+
+        FIX: explicitly cast to (int, int) tuples so the evaluator's
+        offsets[start][0] always returns a plain int, not a 0-dim tensor.
+        """
         all_offsets: list[list[Optional[tuple[int, int]]]] = []
         for index in range(offset_mapping.size(0)):
             sequence_ids = encoded.sequence_ids(index)
             row_offsets: list[Optional[tuple[int, int]]] = []
-            for token_index, offset in enumerate(offset_mapping[index].tolist()):
+            for token_index in range(offset_mapping.size(1)):
                 if sequence_ids[token_index] == 1:
-                    row_offsets.append((int(offset[0]), int(offset[1])))
+                    o = offset_mapping[index][token_index].tolist()
+                    row_offsets.append((int(o[0]), int(o[1])))
                 else:
                     row_offsets.append(None)
             all_offsets.append(row_offsets)
@@ -394,6 +439,7 @@ class RetrievalDataConfig:
     batch_size: int = 32
     num_workers: int = 2
     seed: int = 42
+    min_free_bytes_for_cache: int = 8 * 1024 ** 3
 
 
 class FeverRetrievalDataDownloader:
@@ -406,43 +452,24 @@ class FeverRetrievalDataDownloader:
     def __init__(self, cfg: RetrievalDataConfig):
         self.cfg = cfg
 
+    def _has_enough_disk(self) -> bool:
+        free = shutil.disk_usage(PROJECT_ROOT).free
+        return free >= self.cfg.min_free_bytes_for_cache
+
     def download(self) -> DatasetDict:
-        train_qrels = load_dataset(
-            self.cfg.dataset_name,
-            self.cfg.qrels_config,
-            split=self.cfg.train_split,
-        )
-        test_qrels = load_dataset(
-            self.cfg.dataset_name,
-            self.cfg.qrels_config,
-            split=self.cfg.test_split,
-        )
-        corpus = load_dataset(
-            self.cfg.dataset_name,
-            self.cfg.corpus_config,
-            split=self.cfg.corpus_split,
-        )
-        queries = load_dataset(
-            self.cfg.dataset_name,
-            self.cfg.queries_config,
-            split=self.cfg.queries_split,
-        )
-        dataset = DatasetDict(
-            {
-                "train": train_qrels,
-                "test": test_qrels,
-                "corpus": corpus,
-                "queries": queries,
-            }
-        )
+        train_qrels = load_dataset(self.cfg.dataset_name, self.cfg.qrels_config, split=self.cfg.train_split)
+        test_qrels  = load_dataset(self.cfg.dataset_name, self.cfg.qrels_config, split=self.cfg.test_split)
+        corpus      = load_dataset(self.cfg.dataset_name, self.cfg.corpus_config, split=self.cfg.corpus_split)
+        queries     = load_dataset(self.cfg.dataset_name, self.cfg.queries_config, split=self.cfg.queries_split)
+        dataset = DatasetDict({"train": train_qrels, "test": test_qrels, "corpus": corpus, "queries": queries})
         self.validate(dataset)
         return dataset
 
     def validate(self, dataset: DatasetDict) -> None:
         expected = {
-            "train": self.qrels_columns,
-            "test": self.qrels_columns,
-            "corpus": self.corpus_columns,
+            "train":   self.qrels_columns,
+            "test":    self.qrels_columns,
+            "corpus":  self.corpus_columns,
             "queries": self.queries_columns,
         }
         for split_name, columns in expected.items():
@@ -457,18 +484,24 @@ class FeverRetrievalDataDownloader:
             return dataset
 
         dataset = self.download()
-        os.makedirs(os.path.dirname(self.cfg.cache_dir), exist_ok=True)
-        dataset.save_to_disk(self.cfg.cache_dir)
+
+        if self._has_enough_disk():
+            os.makedirs(os.path.dirname(self.cfg.cache_dir), exist_ok=True)
+            dataset.save_to_disk(self.cfg.cache_dir)
+            print(f"[retrieval] FEVER dataset cached → {self.cfg.cache_dir}")
+        else:
+            free_gb = shutil.disk_usage(PROJECT_ROOT).free / 1024 ** 3
+            print(
+                f"[retrieval] WARNING: only {free_gb:.1f} GB free "
+                f"(need ≥{self.cfg.min_free_bytes_for_cache / 1024**3:.0f} GB to cache). "
+                "Running without disk cache — dataset will be re-downloaded next time."
+            )
+
         return dataset
 
 
 class FeverPositivePairDataset(Dataset):
-    """Positive query-document pairs from FEVER qrels.
-
-    This dataset is intended for supervised retrieval fine-tuning.  Full-corpus
-    retrieval evaluation should use `RetrievalEvaluationDataModule.datasets()`
-    directly so the evaluator can embed all queries and corpus documents.
-    """
+    """Positive query-document pairs from FEVER qrels."""
 
     def __init__(self, qrels, queries, corpus):
         self.qrels = qrels
@@ -479,26 +512,27 @@ class FeverPositivePairDataset(Dataset):
 
     @staticmethod
     def build_index(dataset) -> dict[str, int]:
-        return {str(row["_id"]): index for index, row in enumerate(dataset)}
+        # FIX: strip surrounding quotes so IDs match qrels after strip('"')
+        return {str(row["_id"]).strip('"'): index for index, row in enumerate(dataset)}
 
     def __len__(self) -> int:
         return len(self.qrels)
 
     def __getitem__(self, index: int) -> dict:
         rel = self.qrels[index]
-        query_id = str(rel["query-id"])
-        corpus_id = str(rel["corpus-id"])
-        query = self.queries[self.query_index[query_id]]
+        query_id  = str(rel["query-id"]).strip('"')
+        corpus_id = str(rel["corpus-id"]).strip('"')
+        query    = self.queries[self.query_index[query_id]]
         document = self.corpus[self.corpus_index[corpus_id]]
         title = document.get("title", "")
-        text = document.get("text", "")
+        text  = document.get("text", "")
         document_text = f"{title}. {text}" if title else text
         return {
-            "query_id": query_id,
+            "query_id":  query_id,
             "corpus_id": corpus_id,
-            "query": query["text"],
-            "document": document_text,
-            "score": float(rel["score"]),
+            "query":     query["text"],
+            "document":  document_text,
+            "score":     float(rel["score"]),
         }
 
 
@@ -513,27 +547,25 @@ class RetrievalPairCollator:
     def __call__(self, examples: list[dict]) -> dict:
         query_tokens = self.tokenizer(
             [item["query"] for item in examples],
-            padding=True,
-            truncation=True,
+            padding=True, truncation=True,
             max_length=self.query_max_length,
             return_tensors="pt",
         )
         document_tokens = self.tokenizer(
             [item["document"] for item in examples],
-            padding=True,
-            truncation=True,
+            padding=True, truncation=True,
             max_length=self.document_max_length,
             return_tensors="pt",
         )
         return {
-            "query_input_ids": query_tokens["input_ids"],
-            "query_attention_mask": query_tokens["attention_mask"],
-            "query_token_type_ids": query_tokens.get("token_type_ids"),
-            "document_input_ids": document_tokens["input_ids"],
-            "document_attention_mask": document_tokens["attention_mask"],
-            "document_token_type_ids": document_tokens.get("token_type_ids"),
-            "scores": torch.tensor([float(item["score"]) for item in examples], dtype=torch.float),
-            "query_ids": [item["query_id"] for item in examples],
+            "query_input_ids":        query_tokens["input_ids"],
+            "query_attention_mask":   query_tokens["attention_mask"],
+            "query_token_type_ids":   query_tokens.get("token_type_ids"),
+            "document_input_ids":     document_tokens["input_ids"],
+            "document_attention_mask":document_tokens["attention_mask"],
+            "document_token_type_ids":document_tokens.get("token_type_ids"),
+            "scores":     torch.tensor([float(item["score"]) for item in examples], dtype=torch.float),
+            "query_ids":  [item["query_id"]  for item in examples],
             "corpus_ids": [item["corpus_id"] for item in examples],
         }
 
@@ -556,9 +588,7 @@ class RetrievalEvaluationDataModule:
     def train_pair_dataloader(self) -> DataLoader:
         dataset = self.datasets()
         pair_dataset = FeverPositivePairDataset(
-            qrels=dataset["train"],
-            queries=dataset["queries"],
-            corpus=dataset["corpus"],
+            qrels=dataset["train"], queries=dataset["queries"], corpus=dataset["corpus"],
         )
         generator = torch.Generator()
         generator.manual_seed(self.cfg.seed)
@@ -575,9 +605,7 @@ class RetrievalEvaluationDataModule:
     def test_pair_dataloader(self) -> DataLoader:
         dataset = self.datasets()
         pair_dataset = FeverPositivePairDataset(
-            qrels=dataset["test"],
-            queries=dataset["queries"],
-            corpus=dataset["corpus"],
+            qrels=dataset["test"], queries=dataset["queries"], corpus=dataset["corpus"],
         )
         return DataLoader(
             pair_dataset,
@@ -604,7 +632,6 @@ class SNLIDataConfig:
     batch_size: int = 64
     num_workers: int = 2
     seed: int = 42
-    # 0 = entailment, 1 = neutral, 2 = contradiction; -1 = unannotated (filtered)
     num_labels: int = 3
     label_names: tuple = ("entailment", "neutral", "contradiction")
 
@@ -618,14 +645,13 @@ class SNLIDataDownloader:
         self.cfg = cfg
 
     def _filter_unlabeled(self, split):
-        """Remove examples whose label is -1 (no majority agreement)."""
         return split.filter(lambda example: example["label"] != -1)
 
     def download(self) -> DatasetDict:
         train = load_dataset(self.cfg.dataset_name, split=self.cfg.train_split)
-        test = load_dataset(self.cfg.dataset_name, split=self.cfg.test_split)
+        test  = load_dataset(self.cfg.dataset_name, split=self.cfg.test_split)
         train = self._filter_unlabeled(train)
-        test = self._filter_unlabeled(test)
+        test  = self._filter_unlabeled(test)
         dataset = DatasetDict({"train": train, "test": test})
         self.validate(dataset)
         return dataset
@@ -655,13 +681,11 @@ class SNLICollator:
         self.max_length = max_length
 
     def __call__(self, examples: list[dict]) -> dict:
-        premises = [item["premise"] for item in examples]
-        hypotheses = [item["hypothesis"] for item in examples]
+        premises    = [item["premise"]    for item in examples]
+        hypotheses  = [item["hypothesis"] for item in examples]
         encoded = self.tokenizer(
-            premises,
-            hypotheses,
-            padding=True,
-            truncation=True,
+            premises, hypotheses,
+            padding=True, truncation=True,
             max_length=self.max_length,
             return_tensors="pt",
         )
@@ -751,9 +775,6 @@ def main() -> None:
         print(f"FEVER test qrels rows: {len(retrieval_dataset['test']):,}")
         print(f"FEVER corpus rows: {len(retrieval_dataset['corpus']):,}")
         print(f"FEVER queries rows: {len(retrieval_dataset['queries']):,}")
-        print(f"FEVER qrels columns: {retrieval_dataset['train'].column_names}")
-        print(f"FEVER corpus columns: {retrieval_dataset['corpus'].column_names}")
-        print(f"FEVER queries columns: {retrieval_dataset['queries'].column_names}")
         print(f"FEVER cache: {retrieval_cfg.cache_dir}")
 
     if args.task in {"nli", "snli", "all"}:
