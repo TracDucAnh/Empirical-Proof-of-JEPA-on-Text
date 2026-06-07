@@ -4,8 +4,8 @@ Key design decisions mirroring I-JEPA:
   - Predictor: narrow BERT with input_proj (D→d) and output_proj (d→D).
     Input and output are both in encoder space D; d=384 is an internal bottleneck.
   - Target: raw target-encoder output [B, L, D], NO projection.
-  - Loss: L2 distance is computed for each masked token, then averaged
-    over all masked tokens: (1/M) * sum_j ||pred_j - target_j||.
+  - Loss: squared L2 distance is computed for each masked token, then averaged
+    over all masked tokens: (1/M) * sum_j ||pred_j - target_j||^2.
   - Target encoder updated by EMA only, no gradients.
 """
 
@@ -109,6 +109,7 @@ class JEPAPretrainConfig:
     mask_seed: Optional[int] = None
     # ── EMA ───────────────────────────────────────────────────────────────────
     ema_decay: float = 0.996
+    grad_clip_norm: float = 0.3
     device: str = "auto"
     # ── HuggingFace Hub ───────────────────────────────────────────────────────
     hf_repo_id: str = "ducanhdinh/jepa_proof_tjepa"
@@ -262,12 +263,12 @@ class TextJEPA(nn.Module):
     @staticmethod
     def span_jepa_loss(pred, target, span_mask):
         """
-        Token-level L2 loss over span positions only, averaged over span tokens.
-        Computes the L2 distance for each masked token, then averages those
-        distances over all masked tokens in the batch.
+        Token-level squared L2 loss over span positions only, averaged over span tokens.
+        Computes squared L2 for each masked token, then averages those values
+        over all masked tokens in the batch.
         """
-        l2_per_token = torch.linalg.vector_norm(pred - target, ord=2, dim=-1)
-        masked        = l2_per_token * span_mask.float()
+        squared_l2_per_token = ((pred - target) ** 2).sum(dim=-1)
+        masked = squared_l2_per_token * span_mask.float()
         n_span_tokens = span_mask.float().sum().clamp(min=1.0)
         return masked.sum() / n_span_tokens
 
@@ -415,6 +416,16 @@ class JEPAPretrainer:
         loss, stats = self.objective(output)
         self.optimizer.zero_grad()
         loss.backward()
+        if self.cfg.grad_clip_norm > 0:
+            trainable_parameters = (
+                parameter
+                for parameter in self.model.parameters()
+                if parameter.requires_grad
+            )
+            torch.nn.utils.clip_grad_norm_(
+                trainable_parameters,
+                self.cfg.grad_clip_norm,
+            )
         self.optimizer.step()
         self.scheduler.step()
         self.model.update_target_encoder(self.cfg.ema_decay)
