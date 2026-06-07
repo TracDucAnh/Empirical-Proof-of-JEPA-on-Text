@@ -17,10 +17,13 @@ from torch.optim import AdamW
 from transformers import BertConfig, BertModel
 
 
+BERT_BASE_MAX_POSITION_EMBEDDINGS = 512
+
+
 @dataclass
 class OptimConfig:
     epochs: int = 10
-    batch_size: int = 128
+    batch_size: int = 256
     lr: float = 1e-4
     weight_decay: float = 0.01
     warmup_steps: int = 100
@@ -44,6 +47,7 @@ def move_to_device(batch: dict, device: torch.device) -> dict:
 
 
 def build_bert_base_config(max_length: int, vocab_size: int = 30522) -> BertConfig:
+    max_position_embeddings = max(BERT_BASE_MAX_POSITION_EMBEDDINGS, max_length)
     return BertConfig(
         vocab_size=vocab_size,
         hidden_size=768,
@@ -53,7 +57,7 @@ def build_bert_base_config(max_length: int, vocab_size: int = 30522) -> BertConf
         hidden_act="gelu",
         hidden_dropout_prob=0.1,
         attention_probs_dropout_prob=0.1,
-        max_position_embeddings=max_length,
+        max_position_embeddings=max_position_embeddings,
         type_vocab_size=2,
         initializer_range=0.02,
         layer_norm_eps=1e-12,
@@ -100,6 +104,33 @@ def save_checkpoint(
     if extra:
         payload.update(extra)
     torch.save(payload, path)
+
+
+def move_optimizer_state_to_device(optimizer: AdamW, device: torch.device) -> None:
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device)
+
+
+def load_training_checkpoint(
+    path: str,
+    model: nn.Module,
+    optimizer: AdamW,
+    scheduler,
+    device: torch.device,
+) -> dict:
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    required = ("model", "optimizer", "scheduler")
+    missing = [key for key in required if key not in checkpoint]
+    if missing:
+        raise KeyError(f"Checkpoint {path} is missing training state: {missing}")
+
+    model.load_state_dict(checkpoint["model"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    move_optimizer_state_to_device(optimizer, device)
+    scheduler.load_state_dict(checkpoint["scheduler"])
+    return checkpoint
 
 
 class LossPlotter:

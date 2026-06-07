@@ -4,8 +4,8 @@ Key design decisions mirroring I-JEPA:
   - Predictor: narrow BERT with input_proj (D→d) and output_proj (d→D).
     Input and output are both in encoder space D; d=384 is an internal bottleneck.
   - Target: raw target-encoder output [B, L, D], NO projection.
-  - Loss: token-level L2 over span positions, averaged over spans (not mean-pooled first).
-    Formula matches paper: (1/M) * sum_i sum_{j in B_i} ||pred_j - target_j||^2
+  - Loss: L2 distance is computed for each masked token, then averaged
+    over all masked tokens: (1/M) * sum_j ||pred_j - target_j||.
   - Target encoder updated by EMA only, no gradients.
 """
 
@@ -37,7 +37,9 @@ from pretrained_data_sampler import JEPASpanMaskCollator, TextDataConfig, build_
 from pretrain.common import (
     LossPlotter,
     OptimConfig,
+    BERT_BASE_MAX_POSITION_EMBEDDINGS,
     device_from_config,
+    load_training_checkpoint,
     make_optimizer,
     make_scheduler,
     move_to_device,
@@ -54,7 +56,8 @@ def build_bert_base_config(max_length: int = 256) -> BertConfig:
         vocab_size=30522, hidden_size=768, num_hidden_layers=12,
         num_attention_heads=12, intermediate_size=3072, hidden_act="gelu",
         hidden_dropout_prob=0.1, attention_probs_dropout_prob=0.1,
-        max_position_embeddings=max_length, type_vocab_size=2,
+        max_position_embeddings=max(BERT_BASE_MAX_POSITION_EMBEDDINGS, max_length),
+        type_vocab_size=2,
         initializer_range=0.02, layer_norm_eps=1e-12, pad_token_id=0,
         position_embedding_type="absolute",
     )
@@ -65,7 +68,8 @@ def build_bert_large_config(max_length: int = 256) -> BertConfig:
         vocab_size=30522, hidden_size=1024, num_hidden_layers=24,
         num_attention_heads=16, intermediate_size=4096, hidden_act="gelu",
         hidden_dropout_prob=0.1, attention_probs_dropout_prob=0.1,
-        max_position_embeddings=max_length, type_vocab_size=2,
+        max_position_embeddings=max(BERT_BASE_MAX_POSITION_EMBEDDINGS, max_length),
+        type_vocab_size=2,
         initializer_range=0.02, layer_norm_eps=1e-12, pad_token_id=0,
         position_embedding_type="absolute",
     )
@@ -92,12 +96,12 @@ class JEPAPretrainConfig:
     plot_every: int = 10
     resume_from_latest: bool = True
     # ── architecture ──────────────────────────────────────────────────────────
-    model_name: str = "bert_large"   # "bert_base" | "bert_large"
-    hidden_dim: int = 1024           # D: must match model_name (bert_large=1024)
-    predictor_dim: int = 512         # d: recommended D/2 = 512
+    model_name: str = "bert_base"    # "bert_base" | "bert_large"
+    hidden_dim: int = 768            # D: must match model_name (bert_base=768)
+    predictor_dim: int = 384         # d: recommended D/2 = 384
     predictor_layers: int = 4
-    predictor_heads: int = 8         # predictor_dim (512) % heads == 0
-    predictor_ffn_dim: int = 2048    # 4 * predictor_dim
+    predictor_heads: int = 6         # predictor_dim (384) % heads == 0
+    predictor_ffn_dim: int = 1536    # 4 * predictor_dim
     # ── masking ───────────────────────────────────────────────────────────────
     max_span_length: int = 5
     max_num_spans: int = 5
@@ -136,7 +140,8 @@ class SmallBertPredictor(nn.Module):
             num_attention_heads=num_heads, intermediate_size=ffn_dim,
             hidden_act="gelu", hidden_dropout_prob=dropout,
             attention_probs_dropout_prob=dropout,
-            max_position_embeddings=max_length, type_vocab_size=2,
+            max_position_embeddings=max(BERT_BASE_MAX_POSITION_EMBEDDINGS, max_length),
+            type_vocab_size=2,
             initializer_range=0.02, layer_norm_eps=1e-12, pad_token_id=0,
             position_embedding_type="absolute",
         )
@@ -258,9 +263,10 @@ class TextJEPA(nn.Module):
     def span_jepa_loss(pred, target, span_mask):
         """
         Token-level L2 loss over span positions only, averaged over span tokens.
-        Mirrors I-JEPA eq: (1/M) Σ_i Σ_{j∈B_i} ‖pred_j − target_j‖²
+        Computes the L2 distance for each masked token, then averages those
+        distances over all masked tokens in the batch.
         """
-        l2_per_token = ((pred - target) ** 2).sum(dim=-1)
+        l2_per_token = torch.linalg.vector_norm(pred - target, ord=2, dim=-1)
         masked        = l2_per_token * span_mask.float()
         n_span_tokens = span_mask.float().sum().clamp(min=1.0)
         return masked.sum() / n_span_tokens
@@ -443,10 +449,13 @@ class JEPAPretrainer:
         if not os.path.exists(path):
             return
 
-        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        self.model.load_state_dict(checkpoint["model"])
-        self.optimizer.load_state_dict(checkpoint["optimizer"])
-        self.scheduler.load_state_dict(checkpoint["scheduler"])
+        checkpoint = load_training_checkpoint(
+            path,
+            self.model,
+            self.optimizer,
+            self.scheduler,
+            self.device,
+        )
         self.best_validation_loss = float(checkpoint.get("best_validation_loss", float("inf")))
         self.global_step = int(checkpoint.get("step", 0))
         self.start_epoch = int(checkpoint.get("epoch", -1)) + 1

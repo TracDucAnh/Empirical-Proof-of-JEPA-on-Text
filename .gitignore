@@ -1,3 +1,5 @@
 .env
 pretrained_text_cache/
 outputs/
+__pycache__/
+pretrain/__pycache__/

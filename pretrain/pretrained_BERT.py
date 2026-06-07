@@ -41,6 +41,7 @@ from pretrain.common import (
     OptimConfig,
     build_bert_base_config,
     device_from_config,
+    load_training_checkpoint,
     make_optimizer,
     make_scheduler,
     move_to_device,
@@ -181,10 +182,13 @@ class BERTPretrainer:
         if not os.path.exists(path):
             return
 
-        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        self.model.load_state_dict(checkpoint["model"])
-        self.optimizer.load_state_dict(checkpoint["optimizer"])
-        self.scheduler.load_state_dict(checkpoint["scheduler"])
+        checkpoint = load_training_checkpoint(
+            path,
+            self.model,
+            self.optimizer,
+            self.scheduler,
+            self.device,
+        )
         self.best_validation_loss = float(checkpoint.get("best_validation_loss", float("inf")))
         self.global_step = int(checkpoint.get("step", 0))
         self.start_epoch = int(checkpoint.get("epoch", -1)) + 1
