@@ -55,13 +55,13 @@ from pretrained_data_sampler import (
 from pretrain.common import (
     LossPlotter,
     OptimConfig,
-    BERT_BASE_MAX_POSITION_EMBEDDINGS,
     device_from_config,
-    load_training_checkpoint,
-    make_optimizer,
     move_to_device,
-    save_checkpoint,
 )
+
+# BERT base supports up to 512 positions; hard-coded here because
+# common.py does not export this constant.
+BERT_BASE_MAX_POSITION_EMBEDDINGS: int = 512
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -96,6 +96,50 @@ _ENCODER_CONFIGS: dict[str, callable] = {
     "bert_base":  build_bert_base_config,
     "bert_large": build_bert_large_config,
 }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2b.  Checkpoint helpers  (common.py không có load; save yêu cầu scheduler)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _load_checkpoint(
+    path: str,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> dict:
+    """
+    Load a checkpoint saved by common.save_checkpoint.
+    Returns the full payload dict so callers can read extra keys.
+    """
+    payload = torch.load(path, map_location=device)
+    model.load_state_dict(payload["model"])
+    optimizer.load_state_dict(payload["optimizer"])
+    return payload
+
+
+def _save_checkpoint(
+    path: str,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    step: int,
+    extra: Optional[dict] = None,
+) -> None:
+    """
+    Like common.save_checkpoint but without a scheduler argument.
+    Saves: epoch, step, model state, optimizer state, + extra keys.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = {
+        "epoch":     epoch,
+        "step":      step,
+        "model":     model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+    }
+    if extra:
+        payload.update(extra)
+    torch.save(payload, path)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -549,12 +593,10 @@ class JEPAPretrainer:
         if not os.path.exists(path):
             return
 
-        # Pass scheduler=None because we manage lr/wd manually.
-        checkpoint = load_training_checkpoint(
+        checkpoint = _load_checkpoint(
             path,
             self.model,
             self.optimizer,
-            None,           # no HF scheduler to restore
             self.device,
         )
         self.best_validation_loss = float(checkpoint.get("best_validation_loss", float("inf")))
@@ -652,11 +694,10 @@ class JEPAPretrainer:
         validation_loss: float,
         checkpoint_type: str,
     ) -> None:
-        save_checkpoint(
+        _save_checkpoint(
             path,
             self.model,
             self.optimizer,
-            None,           # no HF scheduler object to save
             epoch,
             step,
             extra={
