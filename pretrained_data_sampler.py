@@ -366,8 +366,8 @@ class BertSentencePairDataset(Dataset):
 
 
 class SpanMasker:
-    """Contiguous span masking used to create text augmentations."""
-
+    """Áp dụng danh sách span đã tính sẵn lên input_ids."""
+ 
     def __init__(
         self,
         mask_token_id: int = 103,
@@ -381,15 +381,25 @@ class SpanMasker:
         self.sep_token_id = sep_token_id
         self.pad_token_id = pad_token_id
         self.max_span_length = max_span_length
-
-    def mask_one(self, input_ids: torch.Tensor, rng: random.Random) -> Tuple[torch.Tensor, torch.Tensor]:
+ 
+    # ------------------------------------------------------------------
+    # Hàm gốc (giữ nguyên để không phá các chỗ khác dùng mask_one)
+    # ------------------------------------------------------------------
+    def mask_one(
+        self, input_ids: torch.Tensor, rng: random.Random
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Mask DUY NHẤT một span ngẫu nhiên (API cũ, giữ tương thích)."""
         masked = input_ids.clone()
         span_mask = torch.zeros_like(input_ids)
         special = {self.cls_token_id, self.sep_token_id, self.pad_token_id}
-        valid = [idx for idx, token_id in enumerate(input_ids.tolist()) if token_id not in special]
+        valid = [
+            idx
+            for idx, token_id in enumerate(input_ids.tolist())
+            if token_id not in special
+        ]
         if not valid:
             return masked, span_mask
-
+ 
         max_len = min(self.max_span_length, len(valid))
         span_len = rng.randint(1, max_len)
         start_candidates = []
@@ -397,15 +407,93 @@ class SpanMasker:
             chunk = valid[i : i + span_len]
             if len(chunk) == span_len and chunk[-1] - chunk[0] + 1 == span_len:
                 start_candidates.append(chunk[0])
-
+ 
         start = rng.choice(start_candidates) if start_candidates else rng.choice(valid)
-        span_positions = list(range(start, min(start + span_len, len(input_ids))))
-        for pos in span_positions:
+        for pos in range(start, min(start + span_len, len(input_ids))):
             if int(input_ids[pos]) not in special:
                 masked[pos] = self.mask_token_id
                 span_mask[pos] = 1
         return masked, span_mask
+ 
+    # ------------------------------------------------------------------
+    # Hàm mới: áp span đã tính sẵn
+    # ------------------------------------------------------------------
+    def apply_spans(
+        self,
+        input_ids: torch.Tensor,
+        spans: List[Tuple[int, int]],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Nhận danh sách (start, end) inclusive và ghi [MASK] vào các vị trí đó."""
+        masked = input_ids.clone()
+        span_mask = torch.zeros_like(input_ids)
+        special = {self.cls_token_id, self.sep_token_id, self.pad_token_id}
+        for start, end in spans:
+            for pos in range(start, end + 1):
+                if int(input_ids[pos]) not in special:
+                    masked[pos] = self.mask_token_id
+                    span_mask[pos] = 1
+        return masked, span_mask
 
+
+def _sample_two_view_spans(
+    valid_positions: List[int],
+    n_tokens_to_mask: int,
+    max_span_length: int,
+    rng: random.Random,
+) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
+    """
+    Chia ~n_tokens_to_mask vị trí hợp lệ thành 2 tập span không overlap.
+ 
+    Thuật toán:
+      1. Sample span liên tiếp ngẫu nhiên từ valid_positions cho đến khi
+         đủ n_tokens_to_mask token đã được chọn.
+      2. Xáo trộn thứ tự các span rồi chia xen kẽ: span chẵn → view1,
+         span lẻ → view2 (đảm bảo không overlap vì pool không trùng).
+    """
+    available = set(valid_positions)
+    pos_index = {p: i for i, p in enumerate(valid_positions)}  # vị trí → thứ tự trong valid
+    used: set[int] = set()
+    spans: List[Tuple[int, int]] = []
+    collected = 0
+ 
+    attempts = 0
+    max_attempts = len(valid_positions) * 4
+ 
+    while collected < n_tokens_to_mask and attempts < max_attempts:
+        attempts += 1
+        free = [p for p in valid_positions if p not in used]
+        if not free:
+            break
+ 
+        # Chọn độ dài span
+        remaining = n_tokens_to_mask - collected
+        max_len = min(max_span_length, remaining, len(free))
+        if max_len < 1:
+            break
+        span_len = rng.randint(1, max_len)
+ 
+        # Tìm các start hợp lệ: span_len token liên tiếp, không overlap
+        valid_starts = []
+        for i in range(len(valid_positions) - span_len + 1):
+            chunk = valid_positions[i : i + span_len]
+            # Phải liên tiếp trong chuỗi gốc và không ai bị used
+            if chunk[-1] - chunk[0] + 1 == span_len and not any(p in used for p in chunk):
+                valid_starts.append(chunk[0])
+ 
+        if not valid_starts:
+            break
+ 
+        start = rng.choice(valid_starts)
+        end = start + span_len - 1
+        spans.append((start, end))
+        used.update(range(start, end + 1))
+        collected += span_len
+ 
+    # Chia xen kẽ sang 2 view
+    rng.shuffle(spans)
+    view1_spans = spans[0::2]
+    view2_spans = spans[1::2]
+    return view1_spans, view2_spans
 
 class BertMLMCollator:
     """Dynamic BERT MLM corruption with the 80/10/10 replacement rule."""
@@ -474,37 +562,91 @@ class BertPretrainingCollator(BertMLMCollator):
 
 
 class TwoViewSpanMaskCollator:
-    """Create two independently span-masked views for Siamese objectives."""
-
-    def __init__(self, max_span_length: int = 5, seed: int = 42):
-        self.masker = SpanMasker(max_span_length=max_span_length)
+    """
+    Tạo 2 view span-masked NON-OVERLAPPING cho VICReg / BYOL / Barlow Twins.
+ 
+    Thay đổi so với bản gốc:
+    - Tổng số token bị mask = mask_ratio_low..mask_ratio_high (15–20%) của
+      số token hợp lệ trong mỗi câu.
+    - Span dài 1–max_span_length token (mặc định 1–5).
+    - 2 view KHÔNG overlap: mỗi vị trí chỉ xuất hiện trong đúng 1 view.
+    """
+ 
+    def __init__(
+        self,
+        max_span_length: int = 5,
+        mask_ratio_low: float = 0.15,
+        mask_ratio_high: float = 0.20,
+        mask_token_id: int = 103,
+        cls_token_id: int = 101,
+        sep_token_id: int = 102,
+        pad_token_id: int = 0,
+        seed: int = 42,
+    ):
+        if not (0 < mask_ratio_low <= mask_ratio_high < 1):
+            raise ValueError("Cần 0 < mask_ratio_low <= mask_ratio_high < 1.")
+        self.masker = SpanMasker(
+            mask_token_id=mask_token_id,
+            cls_token_id=cls_token_id,
+            sep_token_id=sep_token_id,
+            pad_token_id=pad_token_id,
+            max_span_length=max_span_length,
+        )
+        self.max_span_length = max_span_length
+        self.mask_ratio_low = mask_ratio_low
+        self.mask_ratio_high = mask_ratio_high
         self.seed = seed
         self.calls = 0
-
+ 
+    def _valid_positions(self, ids: torch.Tensor, attention_mask: torch.Tensor) -> List[int]:
+        special = {
+            self.masker.cls_token_id,
+            self.masker.sep_token_id,
+            self.masker.pad_token_id,
+        }
+        return [
+            idx
+            for idx in range(ids.size(0))
+            if int(ids[idx]) not in special and int(attention_mask[idx]) == 1
+        ]
+ 
     def __call__(self, examples: List[dict]) -> dict:
         input_ids = torch.stack([item["input_ids"] for item in examples])
         attention_mask = torch.stack([item["attention_mask"] for item in examples])
         token_type_ids = torch.stack([item["token_type_ids"] for item in examples])
-
-        view1, view2 = [], []
-        for row, ids in enumerate(input_ids):
-            rng1 = random.Random(self.seed + self.calls * 2_000_003 + row)
-            rng2 = random.Random(self.seed + self.calls * 2_000_003 + 1_000_003 + row)
-            masked1, _ = self.masker.mask_one(ids, rng1)
-            masked2, _ = self.masker.mask_one(ids, rng2)
-            view1.append(masked1)
-            view2.append(masked2)
-
+ 
+        view1_list, view2_list = [], []
+ 
+        for row in range(input_ids.size(0)):
+            ids = input_ids[row]
+            attn = attention_mask[row]
+            rng = random.Random(self.seed + self.calls * 2_000_003 + row)
+ 
+            valid = self._valid_positions(ids, attn)
+            n_valid = len(valid)
+ 
+            # Tổng token cần mask (15–20%)
+            ratio = rng.uniform(self.mask_ratio_low, self.mask_ratio_high)
+            n_to_mask = max(2, round(n_valid * ratio))  # ít nhất 2 để chia được 2 view
+ 
+            v1_spans, v2_spans = _sample_two_view_spans(
+                valid, n_to_mask, self.max_span_length, rng
+            )
+ 
+            masked1, _ = self.masker.apply_spans(ids, v1_spans)
+            masked2, _ = self.masker.apply_spans(ids, v2_spans)
+            view1_list.append(masked1)
+            view2_list.append(masked2)
+ 
         self.calls += 1
         return {
-            "view1_input_ids": torch.stack(view1),
+            "view1_input_ids": torch.stack(view1_list),
             "view1_attention_mask": attention_mask,
             "view1_token_type_ids": token_type_ids,
-            "view2_input_ids": torch.stack(view2),
+            "view2_input_ids": torch.stack(view2_list),
             "view2_attention_mask": attention_mask,
             "view2_token_type_ids": token_type_ids,
         }
-
 
 class JEPASpanMaskCollator:
     """Create clean and multi-span masked views for Text-JEPA."""
