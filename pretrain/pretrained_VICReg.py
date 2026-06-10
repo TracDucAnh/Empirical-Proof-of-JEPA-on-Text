@@ -175,7 +175,9 @@ class VICRegPretrainer:
 
     @torch.no_grad()
     def evaluate(self) -> dict:
-        self.model.eval()
+        # Chỉ set encoder sang eval nếu có Dropout, còn BN giữ train mode
+        # Hoặc đơn giản nhất: KHÔNG gọi self.model.eval() ở đây
+        self.model.train()  # ← giữ train mode để BN dùng batch stats
         totals = {"loss": 0.0, "inv": 0.0, "var": 0.0, "cov": 0.0}
         count = 0
         for batch in self.validation_loader:
@@ -185,7 +187,7 @@ class VICRegPretrainer:
             for key in totals:
                 totals[key] += stats[key]
             count += 1
-        self.model.train()
+        # self.model.train() ← không cần nữa vì đã ở train mode
         return {key: value / max(1, count) for key, value in totals.items()}
 
     def checkpoint_path(self) -> str:
