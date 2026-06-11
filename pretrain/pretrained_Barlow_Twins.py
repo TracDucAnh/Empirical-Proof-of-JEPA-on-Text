@@ -45,7 +45,7 @@ class BarlowTwinsPretrainConfig:
     plot_every: int = 10
     resume_from_latest: bool = True
     projector_hidden_dim: int = 2048
-    projector_out_dim: int = 256
+    projector_out_dim: int = 8192
     offdiag_coeff: float = 0.005
     max_span_length: int = 5
     device: str = "auto"
