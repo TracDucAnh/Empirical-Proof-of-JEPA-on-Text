@@ -33,6 +33,15 @@ from pretrain.common import (
     save_checkpoint,
 )
 
+HF_REPO_ID = "ducanhdinh/jepa_proof_barlow_twins"
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+HF_TOKEN = os.environ.get("HF_TOKEN")
+
 
 @dataclass
 class BarlowTwinsPretrainConfig:
@@ -196,6 +205,7 @@ class BarlowTwinsPretrainer:
                         f"step={step} validation={val} "
                         f"best_validation_loss={self.best_validation_loss:.4f} saved_best={saved}"
                     )
+                    self.push_to_hub()
                     return
 
             val = self.evaluate()
@@ -207,6 +217,8 @@ class BarlowTwinsPretrainer:
                 f"epoch={epoch + 1} validation={val} "
                 f"best_validation_loss={self.best_validation_loss:.4f} saved_best={saved}"
             )
+
+        self.push_to_hub()
 
     def save_if_best(self, epoch: int, step: int, validation_loss: float) -> bool:
         if validation_loss >= self.best_validation_loss:
@@ -241,6 +253,146 @@ class BarlowTwinsPretrainer:
                 "plotter_state": self.plotter.state_dict(),
             },
         )
+
+    # ── Hugging Face Hub ──────────────────────────────────────────────────────
+
+    def push_to_hub(self, repo_id: str = HF_REPO_ID) -> None:
+        """Push encoder + tokenizer lên Hugging Face Hub."""
+        if not HF_TOKEN:
+            print("⚠  HF_TOKEN không tìm thấy trong .env — bỏ qua push_to_hub.")
+            return
+
+        from huggingface_hub import HfApi, login
+        from transformers import BertTokenizerFast
+
+        print(f"\n🚀 Đang push model lên {repo_id} …")
+        login(token=HF_TOKEN)
+        api = HfApi(token=HF_TOKEN)
+
+        api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
+
+        # Load best checkpoint trước khi push
+        best_path = self.checkpoint_path()
+        if os.path.exists(best_path):
+            checkpoint = torch.load(best_path, map_location="cpu", weights_only=False)
+            self.model.load_state_dict(checkpoint["model"])
+            print(f"   ✓ Loaded best checkpoint từ {best_path}")
+        else:
+            print("   ⚠  Không tìm thấy best checkpoint, push model weights hiện tại.")
+
+        # Encoder BERT
+        encoder_dir = os.path.join(self.cfg.output_dir, "encoder_export")
+        os.makedirs(encoder_dir, exist_ok=True)
+        self.model.encoder.bert.save_pretrained(encoder_dir)
+        api.upload_folder(
+            folder_path=encoder_dir,
+            repo_id=repo_id,
+            repo_type="model",
+            path_in_repo="encoder",
+            commit_message="Add BERT encoder weights",
+        )
+        print("   ✓ BERT encoder đã được push vào thư mục encoder/.")
+
+        # Tokenizer
+        tokenizer = BertTokenizerFast.from_pretrained(
+            "bert-base-uncased",
+            model_max_length=self.cfg.data.max_length,
+        )
+        tokenizer_dir = os.path.join(self.cfg.output_dir, "tokenizer_export")
+        os.makedirs(tokenizer_dir, exist_ok=True)
+        tokenizer.save_pretrained(tokenizer_dir)
+        api.upload_folder(
+            folder_path=tokenizer_dir,
+            repo_id=repo_id,
+            repo_type="model",
+            path_in_repo=".",
+            commit_message="Add tokenizer",
+        )
+        print("   ✓ Tokenizer đã được push.")
+
+        self._push_model_card(repo_id, api)
+        print(f"   ✅ Xong! Model đã có tại https://huggingface.co/{repo_id}\n")
+
+    def _push_model_card(self, repo_id: str, api) -> None:
+        cfg = self.cfg
+        card_content = f"""\
+---
+language: en
+license: apache-2.0
+tags:
+  - bert
+  - barlow-twins
+  - self-supervised-learning
+  - contrastive-learning
+  - span-masking
+  - pretraining
+  - text-embeddings
+---
+
+# {repo_id}
+
+BERT encoder pretrained from scratch với **Barlow Twins**.
+
+## Augmentation strategy
+
+Hai view được tạo bằng **span masking** độc lập (non-overlapping):
+
+| | Mô tả |
+|---|---|
+| **View 1** | Câu gốc với các span ngẫu nhiên bị mask |
+| **View 2** | Câu gốc với các span ngẫu nhiên khác bị mask (không overlap) |
+
+## Kiến trúc Barlow Twins
+
+```
+View 1 ──► Encoder (θ) ──► Projector (θ) ──► z1  ──┐
+                                                     ├──► Cross-correlation C = Z1ᵀZ2 / N  ──► Loss
+View 2 ──► Encoder (θ) ──► Projector (θ) ──► z2  ──┘
+
+Loss = Σ(C_ii - 1)²  +  λ · Σ_{{i≠j}} C_ij²
+```
+
+## Thông số huấn luyện
+
+| Tham số | Giá trị |
+|---|---|
+| Max sequence length | {cfg.data.max_length} |
+| Batch size | {cfg.optim.batch_size} |
+| Epochs | {cfg.optim.epochs} |
+| Learning rate | {cfg.optim.lr} |
+| Projector hidden dim | {cfg.projector_hidden_dim} |
+| Projector out dim | {cfg.projector_out_dim} |
+| Off-diagonal coeff (λ) | {cfg.offdiag_coeff} |
+| Max span length | {cfg.max_span_length} |
+
+## Cách dùng
+
+```python
+from transformers import BertModel, BertTokenizerFast
+import torch
+
+tokenizer = BertTokenizerFast.from_pretrained("{repo_id}")
+bert      = BertModel.from_pretrained("{repo_id}/encoder")
+
+encoded = tokenizer(
+    ["Hello world!", "Barlow Twins pretraining."],
+    return_tensors="pt",
+    padding=True,
+    truncation=True,
+)
+with torch.no_grad():
+    out     = bert(**encoded)
+    cls_emb = out.last_hidden_state[:, 0, :]   # [CLS] token → (B, 768)
+```
+"""
+        api.upload_file(
+            path_or_fileobj=card_content.encode(),
+            path_in_repo="README.md",
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message="Add model card",
+        )
+        print("   ✓ Model card đã được push.")
 
 
 def main() -> None:
