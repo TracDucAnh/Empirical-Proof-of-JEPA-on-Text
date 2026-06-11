@@ -124,145 +124,86 @@ def _valid_positions_batch(input_ids_tensor: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 def _build_view2_for_batch(
-    batch_ids: List[List[int]],
-    max_length: int,
-    model: BertForMaskedLM,
-    device: torch.device,
-    cfg: LexicalSubstitutionConfig,
-    rng: random.Random,
+    batch_ids, max_length, model, device, cfg, rng,
 ) -> List[List[int]]:
-    """
-    Tạo view2 cho cả batch, mỗi câu chỉ cần ĐÚNG 1 BERT forward.
-
-    So với bản gốc (1 forward / vị trí mask):
-      - n_probes giảm từ  B × (avg_masked_positions)  xuống còn  B
-      - Ví dụ: batch=1024, avg_pos=40  →  40 960 probes → 1 024 probes  (~40× ít hơn)
-    """
     B = len(batch_ids)
 
-    # ------------------------------------------------------------------
-    # Bước 1: Pad & tensor hoá tất cả câu (CPU)
-    #   Dùng pinned memory để CPU→GPU overlap với lần forward sau.
-    # ------------------------------------------------------------------
-    def _pad(ids: List[int]) -> List[int]:
+    def _pad(ids):
         s = ids[:max_length]
         return s + [PAD_ID] * (max_length - len(s))
 
     padded = [_pad(ids) for ids in batch_ids]
-
-    # Dùng pin_memory để transfer nhanh hơn lên GPU
-    input_tensor = torch.tensor(padded, dtype=torch.long)             # [B, L] CPU
+    input_tensor = torch.tensor(padded, dtype=torch.long)
     if device.type == "cuda":
         input_tensor = input_tensor.pin_memory()
 
-    view2_tensor = input_tensor.clone()                               # [B, L] CPU
+    # ── Vectorised mask selection ──────────────────────────────────────
+    valid_mask = _valid_positions_batch(input_tensor)          # [B, L] bool
 
-    # ------------------------------------------------------------------
-    # Bước 2: Chọn vị trí mask cho từng câu – vectorised
-    #   valid_mask[b, i] = True nếu token i không phải special.
-    # ------------------------------------------------------------------
-    valid_mask = _valid_positions_batch(input_tensor)                 # [B, L]
+    # Random ratio per sentence
+    ratios = torch.empty(B).uniform_(cfg.mask_ratio_low, cfg.mask_ratio_high)
+    n_valid = valid_mask.sum(dim=1).float()                    # [B]
+    n_mask  = (n_valid * ratios).clamp(min=1).long()           # [B]
 
-    # Đếm số token hợp lệ mỗi câu để tính n_mask
-    valid_counts = valid_mask.sum(dim=1).tolist()                     # [B] Python ints
+    # Noise + mask invalid positions → argsort để "shuffle" valid positions
+    noise = torch.rand(B, max_length)
+    noise[~valid_mask] = 2.0                                   # đẩy invalid xuống cuối
 
-    # Xây probe tensor: bắt đầu từ input_tensor, thay [MASK] tại vị trí chọn
-    probe_tensor = input_tensor.clone()                               # [B, L] CPU
+    sorted_idx = noise.argsort(dim=1)                          # [B, L]
 
-    # Lưu metadata cho scatter về sau
-    all_batch_indices : List[int] = []
-    all_pos_indices   : List[int] = []
-    all_orig_tokens   : List[int] = []
+    # Với mỗi câu b, chọn sorted_idx[b, :n_mask[b]] làm vị trí mask
+    # Dùng arange so sánh để tạo boolean mask — không cần vòng lặp
+    rank = torch.argsort(sorted_idx, dim=1)                    # [B, L]: rank của từng pos
+    chosen_mask = rank < n_mask.unsqueeze(1)                   # [B, L] bool
 
-    for b in range(B):
-        valid_pos = valid_mask[b].nonzero(as_tuple=False).squeeze(1).tolist()
-        if not valid_pos:
-            continue
-        ratio = rng.uniform(cfg.mask_ratio_low, cfg.mask_ratio_high)
-        n = max(1, round(len(valid_pos) * ratio))
-        chosen = rng.sample(valid_pos, min(n, len(valid_pos)))
+    probe_tensor = input_tensor.clone()
+    probe_tensor[chosen_mask] = MASK_ID                        # scatter 1 lần
 
-        for pos in chosen:
-            orig_tok = padded[b][pos]
-            probe_tensor[b, pos] = MASK_ID
-            all_batch_indices.append(b)
-            all_pos_indices.append(pos)
-            all_orig_tokens.append(orig_tok)
+    # Lưu metadata để scatter về sau
+    batch_t    = chosen_mask.nonzero(as_tuple=False)[:, 0]     # [N]
+    pos_t      = chosen_mask.nonzero(as_tuple=False)[:, 1]     # [N]
+    orig_tok_t = input_tensor[batch_t, pos_t]                  # [N]
 
-    if not all_batch_indices:
-        return [padded[i][:len(batch_ids[i])] for i in range(B)]
+    # ── Attention mask ─────────────────────────────────────────────────
+    attn_mask = (input_tensor != PAD_ID).long()
 
-    # ------------------------------------------------------------------
-    # Bước 3: Xây attention mask (vectorised)
-    # ------------------------------------------------------------------
-    attn_mask = (input_tensor != PAD_ID).long()                       # [B, L]
-
-    # ------------------------------------------------------------------
-    # Bước 4: BERT forward – CHỈ 1 LẦN cho cả batch
-    #   Mỗi câu → 1 probe với tất cả [MASK] đã đặt.
-    #   Chia nhỏ thành INFER_CHUNK để tránh OOM.
-    # ------------------------------------------------------------------
+    # ── BERT forward ───────────────────────────────────────────────────
     INFER_CHUNK = 512
-    logits_list: List[torch.Tensor] = []
+    logits_list = []
     model.eval()
-
     use_amp = cfg.use_amp and device.type == "cuda"
 
     with torch.no_grad():
         for start in range(0, B, INFER_CHUNK):
-            chunk_ids  = probe_tensor[start: start + INFER_CHUNK].to(device, non_blocking=True)
-            chunk_attn = attn_mask   [start: start + INFER_CHUNK].to(device, non_blocking=True)
-            # ③ AMP: float16 trên CUDA → throughput cao hơn ~1.5×
+            chunk_ids  = probe_tensor[start:start+INFER_CHUNK].to(device, non_blocking=True)
+            chunk_attn = attn_mask   [start:start+INFER_CHUNK].to(device, non_blocking=True)
             with torch.autocast(device_type=device.type, enabled=use_amp):
                 out = model(input_ids=chunk_ids, attention_mask=chunk_attn)
-            logits_list.append(out.logits.float().cpu())              # [chunk, L, vocab]
+            logits_list.append(out.logits.float().cpu())
 
-    logits_all = torch.cat(logits_list, dim=0)                        # [B, L, vocab]
+    logits_all = torch.cat(logits_list, dim=0)                 # [B, L, vocab]
 
-    # ------------------------------------------------------------------
-    # Bước 5: Thu logits tại đúng từng vị trí mask (vectorised gather)
-    # ------------------------------------------------------------------
-    n_total   = len(all_batch_indices)
-    batch_t   = torch.tensor(all_batch_indices, dtype=torch.long)     # [N]
-    pos_t     = torch.tensor(all_pos_indices,   dtype=torch.long)     # [N]
-    orig_tok_t = torch.tensor(all_orig_tokens,  dtype=torch.long)     # [N]
+    # ── Top-k sampling ─────────────────────────────────────────────────
+    pos_logits = logits_all[batch_t, pos_t, :]                 # [N, vocab]
+    topk_ids   = torch.topk(pos_logits, cfg.top_k, dim=-1).indices  # [N, top_k]
 
-    # logits_all[batch_t[i], pos_t[i], :]  cho mỗi i
-    # Dùng advanced indexing thay cho expand+gather để tiết kiệm bộ nhớ
-    pos_logits = logits_all[batch_t, pos_t, :]                        # [N, vocab]
+    orig_mask_ = topk_ids.eq(orig_tok_t.unsqueeze(1))
+    spec_ids_t = torch.tensor(_SPECIAL_IDS_LIST, dtype=torch.long)
+    spec_mask_ = topk_ids.unsqueeze(2).eq(spec_ids_t.view(1,1,-1)).any(-1)
 
-    # ------------------------------------------------------------------
-    # Bước 6: Top-k + valid_mask + multinomial sampling (fully vectorised)
-    # ------------------------------------------------------------------
-    topk_ids = torch.topk(pos_logits, cfg.top_k, dim=-1).indices      # [N, top_k]
+    valid      = ~orig_mask_ & ~spec_mask_
+    has_valid  = valid.any(dim=-1)
+    weights    = valid.float()
+    weights[~has_valid, 0] = 1.0
 
-    orig_mask  = topk_ids.eq(orig_tok_t.unsqueeze(1))                 # [N, top_k]
-    spec_ids_t = torch.tensor(_SPECIAL_IDS_LIST, dtype=torch.long)    # [S]
-    spec_mask  = topk_ids.unsqueeze(2).eq(
-                     spec_ids_t.view(1, 1, -1)
-                 ).any(dim=-1)                                         # [N, top_k]
+    sample_idx  = torch.multinomial(weights, num_samples=1)
+    chosen_tok  = topk_ids.gather(1, sample_idx).squeeze(1)
+    replacement = torch.where(has_valid, chosen_tok, orig_tok_t)
 
-    valid = ~orig_mask & ~spec_mask                                    # [N, top_k]
-    has_valid = valid.any(dim=-1)                                      # [N]
+    # ── Scatter & trả về ───────────────────────────────────────────────
+    view2_tensor = input_tensor.clone()
+    view2_tensor.index_put_((batch_t, pos_t), replacement)
 
-    weights = valid.float()
-    weights[~has_valid, 0] = 1.0                                       # fallback hàng toàn-zero
-
-    sample_idx  = torch.multinomial(weights, num_samples=1)            # [N, 1]
-    chosen_tok  = topk_ids.gather(1, sample_idx).squeeze(1)           # [N]
-    replacement = torch.where(has_valid, chosen_tok, orig_tok_t)      # [N]
-
-    # ------------------------------------------------------------------
-    # Bước 7: Scatter tất cả replacements vào view2_tensor cùng lúc
-    # ------------------------------------------------------------------
-    view2_tensor.index_put_(
-        indices=(batch_t, pos_t),
-        values=replacement,
-    )
-
-    # ------------------------------------------------------------------
-    # Bước 8: Cắt về độ dài gốc
-    # ------------------------------------------------------------------
     view2_list = view2_tensor.tolist()
     return [v2[:len(orig)] for v2, orig in zip(view2_list, batch_ids)]
 
