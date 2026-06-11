@@ -30,7 +30,7 @@ python lexical_substitution_augmentor.py \
     --train-samples 3000000 \
     --validation-samples 10000 \
     --max-length 256 \
-    --batch-size 256 \
+    --batch-size 1024 \
     --device auto
 """
 
@@ -95,6 +95,9 @@ class LexicalSubstitutionConfig:
 
 _SPECIAL_IDS = {0, 101, 102, 103}   # [PAD]=0, [CLS]=101, [SEP]=102, [MASK]=103
 
+# Tensor version dùng cho mask lọc special tokens trong vectorized path
+_SPECIAL_IDS_LIST = list(_SPECIAL_IDS)   # [0, 101, 102, 103]
+
 
 def _resolve_device(device: str) -> torch.device:
     if device == "auto":
@@ -117,7 +120,7 @@ def _choose_positions(valid: List[int], ratio_low: float, ratio_high: float, rng
 
 
 # ---------------------------------------------------------------------------
-# Core: xây view2 cho một batch câu bằng BERT
+# Core: xây view2 cho một batch câu bằng BERT – token replacement song song
 # ---------------------------------------------------------------------------
 
 def _build_view2_for_batch(
@@ -131,28 +134,41 @@ def _build_view2_for_batch(
     """
     Với mỗi câu trong batch_ids, tạo view2 bằng lexical substitution.
 
-    Với mỗi vị trí được chọn trong câu, hàm tạo một "probe" tensor = bản clone
-    của câu đó với đúng 1 [MASK] tại vị trí đó, sau đó thu thập tất cả probe
-    tensor thành một mini-batch duy nhất, chạy BERT forward một lần, rồi đọc
-    top-k tại từng vị trí và chọn token thay thế.
+    Các probe tensor (mỗi probe = câu với 1 [MASK] tại vị trí cần thay) được
+    gom thành 1 mini-batch duy nhất và chạy BERT forward đúng 1 lần.
 
-    Không gọi BERT nhiều lần: thay vào đó, với B câu mỗi câu có K_i vị trí
-    cần thay, ta tạo tối đa sum(K_i) probe tensor và xử lý hết trong 1 forward.
-    Nếu sum(K_i) > batch_limit thì chia nhỏ bên ngoài (hàm gọi đã chia batch).
+    **Song song hoá replace token:**
+    Sau khi lấy logits, việc chọn và ghi token thay thế cho TẤT CẢ các vị trí
+    được thực hiện hoàn toàn bằng tensor ops (gather / scatter_) – không có
+    vòng lặp Python per-token:
+
+      1. topk_ids  : [n_probes, top_k]  – top-k vocab ids tại vị trí mask
+      2. orig_mask : [n_probes, top_k]  – True nếu ứng viên == original token
+      3. spec_mask : [n_probes, top_k]  – True nếu ứng viên là special token
+      4. valid_mask: [n_probes, top_k]  – ứng viên hợp lệ (không orig, không special)
+      5. fallback  : nếu không có ứng viên nào hợp lệ → giữ original token
+      6. Dùng torch.multinomial để chọn ngẫu nhiên 1 ứng viên / vị trí
+         (equivalent với rng.choice nhưng song song trên toàn tensor)
+      7. scatter_ ghi tất cả token thay thế vào view2_tensor cùng lúc
     """
-    cls_id = 101
-    sep_id = 102
-    pad_id = 0
+    pad_id  = 0
+    cls_id  = 101
+    sep_id  = 102
     mask_id = 103
 
-    # Pad tất cả về max_length
+    # ------------------------------------------------------------------ #
+    # 1. Pad tất cả câu về max_length                                     #
+    # ------------------------------------------------------------------ #
     def pad(ids: List[int]) -> List[int]:
         seq = ids[:max_length]
         return seq + [pad_id] * (max_length - len(seq))
 
-    padded = [pad(ids) for ids in batch_ids]
+    padded: List[List[int]] = [pad(ids) for ids in batch_ids]
 
-    # Chọn vị trí thay thế cho mỗi câu
+    # ------------------------------------------------------------------ #
+    # 2. Chọn vị trí thay thế (Python-level, per-sentence)               #
+    #    Sau bước này toàn bộ công việc tensor.                           #
+    # ------------------------------------------------------------------ #
     chosen_per_sentence: List[List[int]] = []
     for ids in padded:
         valid = _valid_positions(ids)
@@ -160,58 +176,123 @@ def _build_view2_for_batch(
         positions.sort()
         chosen_per_sentence.append(positions)
 
-    # Tạo probe tensors: mỗi (câu i, vị trí j) → 1 row
-    probe_rows: List[List[int]] = []      # input_ids có [MASK] tại vị trí j
-    probe_attn: List[List[int]] = []      # attention_mask tương ứng
-    probe_meta: List[Tuple[int, int, int]] = []  # (sent_idx, pos_in_sent, original_token)
+    # ------------------------------------------------------------------ #
+    # 3. Xây probe tensors                                                #
+    #    probe_input  : [n_probes, max_length]                            #
+    #    probe_attn   : [n_probes, max_length]                            #
+    #    meta_sent    : [n_probes]  – sent index                          #
+    #    meta_pos     : [n_probes]  – position in sentence                #
+    #    meta_orig    : [n_probes]  – original token id                   #
+    # ------------------------------------------------------------------ #
+    probe_rows : List[List[int]] = []
+    probe_attn_rows: List[List[int]] = []
+    meta_sent  : List[int] = []
+    meta_pos   : List[int] = []
+    meta_orig  : List[int] = []
 
     for sent_idx, (ids, positions) in enumerate(zip(padded, chosen_per_sentence)):
         attn = [1 if tok != pad_id else 0 for tok in ids]
         for pos in positions:
-            orig_tok = ids[pos]
             probe = ids.copy()
             probe[pos] = mask_id
             probe_rows.append(probe)
-            probe_attn.append(attn)
-            probe_meta.append((sent_idx, pos, orig_tok))
+            probe_attn_rows.append(attn)
+            meta_sent.append(sent_idx)
+            meta_pos.append(pos)
+            meta_orig.append(ids[pos])
 
-    # Bắt đầu từ bản sao của padded, sẽ ghi token thay thế vào
-    view2 = [ids.copy() for ids in padded]
+    # Bắt đầu từ bản sao padded dạng tensor để scatter_ sau này
+    view2_tensor = torch.tensor(padded, dtype=torch.long)   # [B, max_length] – trên CPU
 
     if not probe_rows:
-        # Không có gì để thay → view2 = bản sao gốc
-        return [ids[:len(orig)] for ids, orig in zip(view2, batch_ids)]
+        # Không có gì để thay → trả về bản sao gốc (cắt về độ dài gốc)
+        return [padded[i][:len(batch_ids[i])] for i in range(len(batch_ids))]
 
-    # Chạy BERT forward theo mini-batch
-    model.eval()
-    probe_input_tensor = torch.tensor(probe_rows, dtype=torch.long, device=device)
-    probe_attn_tensor = torch.tensor(probe_attn, dtype=torch.long, device=device)
+    n_probes = len(probe_rows)
+    probe_input_tensor = torch.tensor(probe_rows,      dtype=torch.long, device=device)  # [P, L]
+    probe_attn_tensor  = torch.tensor(probe_attn_rows, dtype=torch.long, device=device)  # [P, L]
+    sent_idx_t = torch.tensor(meta_sent, dtype=torch.long)   # [P]  – CPU, dùng scatter_
+    pos_idx_t  = torch.tensor(meta_pos,  dtype=torch.long)   # [P]  – CPU
+    orig_tok_t = torch.tensor(meta_orig, dtype=torch.long)   # [P]  – CPU
 
-    INFER_BATCH = 512   # forward batch tối đa để tránh OOM
+    # ------------------------------------------------------------------ #
+    # 4. BERT forward (chia nhỏ nếu cần tránh OOM)                       #
+    # ------------------------------------------------------------------ #
+    INFER_BATCH = 512
     logits_list: List[torch.Tensor] = []
+    model.eval()
     with torch.no_grad():
         for start in range(0, probe_input_tensor.size(0), INFER_BATCH):
-            chunk_ids = probe_input_tensor[start: start + INFER_BATCH]
-            chunk_attn = probe_attn_tensor[start: start + INFER_BATCH]
+            chunk_ids  = probe_input_tensor[start: start + INFER_BATCH]
+            chunk_attn = probe_attn_tensor [start: start + INFER_BATCH]
             out = model(input_ids=chunk_ids, attention_mask=chunk_attn)
-            logits_list.append(out.logits.cpu())   # [chunk, seq_len, vocab]
+            logits_list.append(out.logits.cpu())    # [chunk, L, vocab]
 
-    logits_all = torch.cat(logits_list, dim=0)     # [n_probes, seq_len, vocab]
+    logits_all = torch.cat(logits_list, dim=0)      # [P, L, vocab]
 
-    # Đọc kết quả và ghi vào view2
-    for probe_idx, (sent_idx, pos, orig_tok) in enumerate(probe_meta):
-        pos_logits = logits_all[probe_idx, pos, :]          # [vocab]
-        top_ids = torch.topk(pos_logits, cfg.top_k).indices.tolist()
-        candidates = [t for t in top_ids if t != orig_tok and t not in _SPECIAL_IDS]
-        if candidates:
-            replacement = rng.choice(candidates)
-        else:
-            # Mọi top-k đều là token gốc hoặc special → giữ nguyên
-            replacement = orig_tok
-        view2[sent_idx][pos] = replacement
+    # ------------------------------------------------------------------ #
+    # 5. Thu logits tại đúng vị trí mask của từng probe                  #
+    #    pos_idx_t : [P]  →  expand → [P, 1, vocab]  → squeeze           #
+    # ------------------------------------------------------------------ #
+    pos_expand = pos_idx_t.view(n_probes, 1, 1).expand(n_probes, 1, logits_all.size(-1))
+    pos_logits = logits_all.gather(dim=1, index=pos_expand).squeeze(1)  # [P, vocab]
 
-    # Cắt về độ dài gốc (bỏ padding)
-    return [v2[:len(orig)] for v2, orig in zip(view2, batch_ids)]
+    # ------------------------------------------------------------------ #
+    # 6. Lấy top-k ứng viên song song cho tất cả probe                   #
+    # ------------------------------------------------------------------ #
+    topk_ids = torch.topk(pos_logits, cfg.top_k, dim=-1).indices   # [P, top_k]
+
+    # ------------------------------------------------------------------ #
+    # 7. Xây valid_mask: loại bỏ original token và special tokens        #
+    #    Tất cả ops đều vectorized – không có vòng lặp Python per-probe  #
+    # ------------------------------------------------------------------ #
+    # [P, top_k] – True nếu ứng viên trùng original
+    orig_mask  = topk_ids.eq(orig_tok_t.unsqueeze(1))              # [P, top_k]
+
+    # [P, top_k] – True nếu ứng viên là special token
+    spec_ids_t = torch.tensor(_SPECIAL_IDS_LIST, dtype=torch.long) # [S]
+    spec_mask  = topk_ids.unsqueeze(2).eq(                          # [P, top_k, 1]
+                     spec_ids_t.view(1, 1, -1)                      # [1, 1, S]
+                 ).any(dim=-1)                                       # [P, top_k]
+
+    valid_mask = ~orig_mask & ~spec_mask                            # [P, top_k]
+
+    # ------------------------------------------------------------------ #
+    # 8. Chọn ngẫu nhiên 1 ứng viên hợp lệ / probe (song song)          #
+    #    torch.multinomial thực hiện weighted sampling per-row,          #
+    #    tương đương rng.choice nhưng parallel trên toàn [P, top_k].    #
+    # ------------------------------------------------------------------ #
+    # Nếu cả hàng đều False (không có ứng viên hợp lệ) → fallback gốc
+    has_valid = valid_mask.any(dim=-1)                              # [P]
+
+    # Chuyển mask thành weight float; hàng toàn-zero → fallback sau
+    weights = valid_mask.float()                                    # [P, top_k]
+    # Tránh all-zero để multinomial không bị lỗi: tạm gán weight 1.0 cho
+    # vị trí [0] trên các hàng not-has_valid (kết quả sẽ bị override sau)
+    weights[~has_valid, 0] = 1.0
+
+    # sample_idx : [P, 1]  – chỉ số trong top_k được chọn cho mỗi probe
+    sample_idx = torch.multinomial(weights, num_samples=1)          # [P, 1]
+    chosen_tok = topk_ids.gather(dim=1, index=sample_idx).squeeze(1)  # [P]
+
+    # Với hàng không có ứng viên hợp lệ → giữ token gốc
+    replacement = torch.where(has_valid, chosen_tok, orig_tok_t)   # [P]
+
+    # ------------------------------------------------------------------ #
+    # 9. Scatter tất cả token thay thế vào view2_tensor cùng lúc         #
+    #    view2_tensor[sent_idx_t[i], pos_idx_t[i]] = replacement[i]      #
+    #    Dùng index_put_ (scatter song song, in-place)                    #
+    # ------------------------------------------------------------------ #
+    view2_tensor.index_put_(
+        indices=(sent_idx_t, pos_idx_t),
+        values=replacement,
+    )
+
+    # ------------------------------------------------------------------ #
+    # 10. Chuyển về List[List[int]], cắt về độ dài gốc                   #
+    # ------------------------------------------------------------------ #
+    view2_list = view2_tensor.tolist()
+    return [v2[:len(orig)] for v2, orig in zip(view2_list, batch_ids)]
 
 
 # ---------------------------------------------------------------------------
